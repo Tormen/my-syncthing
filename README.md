@@ -27,6 +27,9 @@ Python 3.9+, standard library only. macOS and Linux.
     my-syncthing status             the status alone (one line per fact, the raw value beside it)
     my-syncthing disable [<FOLDER>] stop syncing a folder on THIS host (none: all folders)
     my-syncthing enable [<FOLDER>]  sync it again
+    my-syncthing doctor [<FOLDER>]  why a folder is out of sync here (read-only)
+    my-syncthing rescan [<FOLDER>]  rescan a folder (none: all)
+    my-syncthing restart            restart Syncthing here
     my-syncthing web                open this host's Syncthing web UI in the default browser
     my-syncthing check              the conditions, told through the alerts
     my-syncthing diag [<BLOCK>]     plan, folders, connections, conflicts, errors,
@@ -37,7 +40,7 @@ Python 3.9+, standard library only. macOS and Linux.
 Modifiers: `-S` (show what would change, change nothing), `-Q` (only
 conditions and errors), `-V` (more detail), `-D` (each REST call),
 `--config <FILE>`. Admin: `--create-config [<FILE>]`, `--test-mail`,
-`--version`, `--run-tests [<FILTER>]`. All of it: `my-syncthing --help`.
+`--export-cert`, `--version`, `--run-tests [<FILTER>]`. All of it: `my-syncthing --help`.
 
 Exit: 0 healthy, 1 a condition holds (or `--install` needs the config
 changed), 2 an error.
@@ -57,6 +60,7 @@ defaults with a comment on each key. The essentials:
     SERVICE_server=daemon          # the hub runs from boot
     ALERT_NOW="notify-send"        # at once:  <command> <subject> <body>
     ALERT_LATER="mail-me"          # once, if the condition still holds ALERT_DELAY later
+    GUI_TLS=yes                    # the web UI over https on every host (empty: left as it is)
 
 Hosts are named as `hostname -s` gives them, lower case, with anything a
 shell variable name cannot hold as `_` (`My-Laptop` -> `my_laptop`).
@@ -85,7 +89,8 @@ a second run prints nothing to change.
    `my-syncthing --install` run as root installs only that, then again as
    the user. `none` -- something else starts Syncthing.
 4. **Settings** by role: listen addresses, the phone-home switches (as
-   switches -- an emptied list comes back as `default`), no browser.
+   switches -- an emptied list comes back as `default`; STUN keep-alive
+   too), no browser, and the web UI's TLS when `GUI_TLS` says.
 5. **Devices**: on the hub every device of the config, on a peer the hub;
    folders are never accepted automatically.
 6. **Folders** this host is named in, with their options and `.stignore`. A
@@ -95,8 +100,16 @@ a second run prints nothing to change.
    copy; the next `--install` then makes it send-and-receive, or says how
    many local changes keep it receive-only (`diag localchanged`). The hub
    starts send-and-receive: its copy is the reference the peers compare
-   with -- were it receive-only too, nobody would send.
+   with -- were it receive-only too, nobody would send. A folder Syncthing
+   already has at ANOTHER path is refused, both paths named: moving a
+   synced folder is a decision for a person.
 7. **The check agent**, every `CHECK_INTERVAL`.
+8. On a peer: the first connection to the hub, waited for up to
+   `CONNECT_WAIT`; if none comes, a warning names the addresses dialled and
+   the hub's listen ports to check in its firewall.
+
+A device ID that is another host's in the config is refused: a copied
+Syncthing config. Each host needs its own identity.
 
 A NEW server: set `HUB=<new name>` and its addresses; every peer's next
 `--install` dials it.
@@ -141,6 +154,35 @@ Conditions (`CONDITIONS` picks): `not-running`, `hub-unreachable` (after
 `ALERT_NOW <subject> <body>` when a condition first holds, `ALERT_LATER`
 once if it still holds `ALERT_DELAY` later, and `ALERT_NOW` once more when
 it clears. `--test-mail` sends one test through `ALERT_LATER`.
+
+## doctor, rescan, restart
+
+`doctor [<FOLDER>]` explains, read-only, why a folder is out of sync here:
+1 the connection to each of its devices, 2 the state, 3 the files still
+needed here (what "out of sync" refers to) and 3b what the others still
+need from here, 4 the per-file errors -- usually THE reason --, 5 conflict
+files, 6 the ignores (a file ignored here never arrives, by design), 7 disk
+space and Syncthing's reserve, 8 the clock.
+
+The remedies, least invasive first:
+
+1. `rescan [<FOLDER>]` (a stale index settles), then `restart`.
+2. One file stuck: delete it HERE; the others send it again.
+3. A conflict file: merge by hand (a KeePass database: Database > Merge From
+   Database), then delete the conflict file.
+4. A permission error: fix the owner or mode of the path named, then 1.
+5. Last resort, on a host whose copy is NOT the only good one: remove the
+   folder in the web UI; `--install` adds it again on the same path -- the
+   data stays, the index is rebuilt.
+
+## The web UI's certificate
+
+With `GUI_TLS=yes` each host's web UI uses its own self-signed
+certificate, and the browser warns until it is trusted. `--export-cert`
+copies it to `~/Desktop/syncthing-<host>.cer` with its subject, expiry and
+SHA-256 fingerprint, and on macOS prints the `security add-trusted-cert`
+line. Trusting must happen at that host's own screen, not over ssh: the
+confirmation dialog appears there.
 
 ## Tests
 
