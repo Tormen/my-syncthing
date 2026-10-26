@@ -89,11 +89,13 @@ a second run prints nothing to change.
 5. **Devices**: on the hub every device of the config, on a peer the hub;
    folders are never accepted automatically.
 6. **Folders** this host is named in, with their options and `.stignore`. A
-   new folder is added paused, gets its ignores, then starts. One whose
-   directory already holds data starts **receive-only**: it sends nothing
-   until its first scan is done and nothing differs here; the next
-   `--install` then makes it send-and-receive, or says how many local
-   changes keep it receive-only (`diag localchanged`).
+   new folder is added paused, gets its ignores, then starts. On a peer,
+   one whose directory already holds data starts **receive-only**: it sends
+   nothing until its first scan is done and nothing differs from the hub's
+   copy; the next `--install` then makes it send-and-receive, or says how
+   many local changes keep it receive-only (`diag localchanged`). The hub
+   starts send-and-receive: its copy is the reference the peers compare
+   with -- were it receive-only too, nobody would send.
 7. **The check agent**, every `CHECK_INTERVAL`.
 
 A NEW server: set `HUB=<new name>` and its addresses; every peer's next

@@ -34,7 +34,7 @@ from typing import Final, NoReturn, cast
 
 NAME: Final = "my-syncthing"
 VERSION: Final = "1.0"
-SCRIPT_COMMIT = "ad84f0d"
+SCRIPT_COMMIT = "c47783b"
 SCRIPT_RELEASE = ""
 CONFIG_ENV: Final = "MY_SYNCTHING_CONFIG"
 ON_MAC: Final = platform.system() == "Darwin"
@@ -651,12 +651,17 @@ def make_plan(cfg: Config, api: Api, host: str, my_id: str) -> Plan:
                 full = False
             except OSError:
                 full = True              # unreadable: assume data, so nothing is sent before it matches
-            kind = "receiveonly" if full else "sendreceive"
+            # The hub's copy is the reference a peer's existing data is compared
+            # with: were the hub receive-only too, nobody would send, and every
+            # host would see all its files as local changes for ever.
+            adopt = full and not is_hub
+            kind = "receiveonly" if adopt else "sendreceive"
             p.changes.append(Change("PUT", f"/rest/config/folders/{f.id}", {
                 "id": f.id, "type": kind, "paused": True,
                 "devices": [{"deviceID": x} for x in devices], **want_f},
                 f"folder {f.id}: added at {path}, {kind}" + (
-                    " -- it already holds data: nothing is sent until it matches the others" if full else "")))
+                    " -- it already holds data: nothing is sent until it matches the hub's" if adopt else
+                    " -- the hub: its data is the reference the peers compare with" if full else "")))
             p.changes.append(Change("POST", f"/rest/db/ignores?folder={f.id}", {"ignore": list(f.ignore)},
                                     f"folder {f.id}: ignores {', '.join(f.ignore) or 'none'}"))
             p.changes.append(Change("PATCH", f"/rest/config/folders/{f.id}", {"paused": False},
@@ -1481,8 +1486,9 @@ ADMIN
                        macOS), its identity, its service (SERVICE), settings,
                        devices, folders, ignores, the check agent. A host the
                        config does not know prints its DEVICE_ line and stops.
-                       A folder that already holds data starts receive-only and
-                       becomes send-and-receive when nothing differs. As root:
+                       On a peer, a folder that already holds data starts
+                       receive-only and becomes send-and-receive when nothing
+                       differs from the hub's copy. As root:
                        only the boot-time service of SERVICE=daemon.
   --uninstall          the service and the check agent; data and identity stay
   --create-config [<FILE>]  print the default config, or write it (never over
@@ -1932,6 +1938,13 @@ def t_receiveonly(t: T) -> None:
     n = len(t.stub.writes)
     t.run("--install")
     t.is_("...and the next run changes nothing", len(t.stub.writes) - n, 0)
+    t.stub.folders = []
+    t.conf(HUB=t.host, **{f"DEVICE_{t.host}": ID_ME, "DEVICE_peerx": ID_HUB,
+                          "FOLDER_data": f"{t.p('data')} hosts={t.host},peerx"})
+    rc, o, _ = t.run("--install")
+    t.is_("the hub, holding data: sendreceive at once -- its copy is the reference",
+          (rc, t.stub.folder("data").get("type")), (0, "sendreceive"))
+    t.has("...saying why", o, "the hub: its data is the reference")
 
 
 def t_unknown_host(t: T) -> None:
