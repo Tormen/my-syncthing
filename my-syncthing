@@ -34,7 +34,7 @@ from typing import Final, NoReturn, cast
 
 NAME: Final = "my-syncthing"
 VERSION: Final = "1.0"
-SCRIPT_COMMIT = "ff465f2"
+SCRIPT_COMMIT = "d2c227b"
 SCRIPT_RELEASE = ""
 CONFIG_ENV: Final = "MY_SYNCTHING_CONFIG"
 ON_MAC: Final = platform.system() == "Darwin"
@@ -1487,8 +1487,13 @@ def version_string() -> str:
     here = os.path.dirname(os.path.realpath(__file__))
     desc = ""
     if shutil.which("git"):
-        p = subprocess.run(["git", "-C", here, "describe", "--tags", "--long"], capture_output=True, text=True)
-        desc = p.stdout.strip() if p.returncode == 0 else ""
+        # git's tags are this tool's releases only in its OWN repository, whose
+        # top is this directory; a copy deployed into another repository would
+        # report that one's tags. There the stamp answers.
+        top = subprocess.run(["git", "-C", here, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        if top.returncode == 0 and os.path.realpath(top.stdout.strip()) == here:
+            p = subprocess.run(["git", "-C", here, "describe", "--tags", "--long"], capture_output=True, text=True)
+            desc = p.stdout.strip() if p.returncode == 0 else ""
     desc = desc or SCRIPT_RELEASE
     m = re.fullmatch(r"(.+)-([0-9]+)-g([0-9a-f]+)", desc)
     if m:
@@ -2054,16 +2059,16 @@ class T:
         with open(self.p("conf"), "w") as fh:
             fh.write("".join(f"{k}={shlex.quote(v)}\n" for k, v in c.items() if v != "" or k == "ALERT_LATER"))
 
-    def proc(self, args: Sequence[str], boom: bool = False) -> subprocess.Popen[bytes]:
+    def proc(self, args: Sequence[str], boom: bool = False, script: str = "") -> subprocess.Popen[bytes]:
         env = {"PATH": self.p("bin") + os.pathsep + os.environ.get("PATH", ""), "HOME": self.p("home"),
                "USER": this_user(), "LINKS": self.p("links"), CONFIG_ENV: self.p("conf")}
         return subprocess.Popen(
-            [sys.executable, "-I", "-S", "-B", "-c", LOADER, os.path.realpath(__file__), self.p("log"),
+            [sys.executable, "-I", "-S", "-B", "-c", LOADER, script or os.path.realpath(__file__), self.p("log"),
              "boom" if boom else "-", *args],
             cwd=self.root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
 
-    def run(self, *args: str, boom: bool = False) -> tuple[int, str, str]:
-        p = self.proc(args, boom)
+    def run(self, *args: str, boom: bool = False, script: str = "") -> tuple[int, str, str]:
+        p = self.proc(args, boom, script)
         o, e = p.communicate()
         return p.returncode, o.decode(errors="replace"), e.decode(errors="replace")
 
@@ -2451,6 +2456,21 @@ def t_face(t: T) -> None:
     t.is_("--install as another user than SYNC_USER: refused", (rc, "run --install as somebody-else" in e), (2, True))
 
 
+def t_version_owner(t: T) -> None:
+    repo = t.p("repo")
+    os.makedirs(os.path.join(repo, "bin"))
+    git = ["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t"]
+    for a in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "x"], ["tag", "foreign-tag"]):
+        subprocess.run(["git", "-C", repo, *a] if a[0] == "init" else git + a, check=True, capture_output=True)
+    for rel in ("bin", ""):
+        shutil.copy(os.path.realpath(__file__), os.path.join(repo, rel, NAME))
+    o = t.run("--version", script=os.path.join(repo, "bin", NAME))[1]
+    t.is_("a copy deployed inside another repository: not that repository's tag",
+          ("foreign-tag" in o, f"(commit {SCRIPT_COMMIT}, build" in o), (False, True))
+    t.has("a copy at the top of its own repository: git's describe", t.run(
+        "--version", script=os.path.join(repo, NAME))[1], "(foreign-tag-0-g")
+
+
 TESTS: Final[tuple[tuple[str, Callable[[T], None]], ...]] = (
     ("config: --create-config, bad lines, a missing file", t_config),
     ("config: none found -- the offer names only searched paths", t_config_offer),
@@ -2475,6 +2495,7 @@ TESTS: Final[tuple[tuple[str, Callable[[T], None]], ...]] = (
     ("rescan, restart", t_rescan_restart),
     ("--export-cert", t_export_cert),
     ("--help, a dashed verb, --version, SYNC_USER", t_face),
+    ("--version: git's tags only where the tool owns the repository", t_version_owner),
 )
 
 
