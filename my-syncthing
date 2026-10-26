@@ -1,0 +1,2175 @@
+#!/usr/bin/env -S python3 -I -S
+"""my-syncthing -- set up and watch a Syncthing cluster from ONE config.
+
+The cluster config says which host is the hub, where it listens, which
+devices exist and which folders go where. `--install` makes the host it runs
+on match it -- Syncthing, its service, its settings, devices, folders and
+ignores -- through Syncthing's own REST API; `status` and `check` report what
+Syncthing actually does. It syncs nothing itself. Stdlib only: -I keeps
+PYTHONPATH and the user's site out, -S skips site.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import platform
+import plistlib
+import re
+import shlex
+import shutil
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from collections.abc import Callable, Sequence
+from typing import Final, NoReturn, cast
+
+NAME: Final = "my-syncthing"
+VERSION: Final = "1.0"
+SCRIPT_COMMIT = "ad84f0d"
+SCRIPT_RELEASE = ""
+CONFIG_ENV: Final = "MY_SYNCTHING_CONFIG"
+ON_MAC: Final = platform.system() == "Darwin"
+
+
+# ---------------------------------------------------------------------------
+# failure
+
+class Err(Exception):
+    """The tool's one failure; its code names the line that raised it."""
+
+    def __init__(self, code: str, msg: str, exit_code: int = 2) -> None:
+        super().__init__(msg)
+        self.code = code
+        self.msg = msg
+        self.exit_code = exit_code
+
+
+def err(code: str, msg: str, exit_code: int = 2) -> NoReturn:
+    raise Err(code, msg, exit_code)
+
+
+class Down(Err):
+    """Syncthing does not answer: a condition for status, an error elsewhere."""
+
+
+# What the run is doing right now -- said when it is interrupted (Ctrl-C).
+PHASE = ["starting"]
+
+
+# ---------------------------------------------------------------------------
+# output: standard on stdout (-Q silences it), -V and -D add, errors on stderr
+
+@dataclass
+class Out:
+    quiet: bool = False
+    vrb: bool = False
+    dbg: bool = False
+    simulate: bool = False
+
+
+OUT = Out()
+
+
+def out(line: str) -> None:
+    if not OUT.quiet:
+        sys.stdout.write(line + "\n")
+
+
+def say(line: str) -> None:
+    """-V: a command or request about to run."""
+    if OUT.vrb:
+        sys.stdout.write(f" >>> {line}\n")
+
+
+def dbg(line: str) -> None:
+    if OUT.dbg:
+        sys.stderr.write(f" ~~~ {line}\n")
+
+
+def warn(line: str) -> None:
+    sys.stderr.write(f"{NAME}: {line}\n")
+
+
+def run(cmd: Sequence[str], why: str = "", capture: bool = True,
+        changes: bool = False) -> subprocess.CompletedProcess[str]:
+    """Run a command; one that CHANGES something is only printed under -S."""
+    say(shlex.join(cmd) + (f"    # {why}" if why else ""))
+    if changes and OUT.simulate:
+        out(f"    > (-S) would run: {shlex.join(cmd)}")
+        return subprocess.CompletedProcess(list(cmd), 0, "", "")
+    sys.stdout.flush()
+    try:
+        return subprocess.run(list(cmd), capture_output=capture, text=True)
+    except OSError as e:
+        err("00001", f"cannot run {cmd[0]}: {e.strerror}")
+
+
+# ---------------------------------------------------------------------------
+# the config: shell syntax, sourced by /bin/sh -- so it may source a site file
+
+DEFAULT_CONFIG: Final = """\
+## my-syncthing -- the cluster config. Shell syntax: /bin/sh sources it, so
+## it may source a site file of its own. The same file on every host.
+
+HUB=""                    # the host every other host dials (required)
+HUB_ADDRESSES=""          # where the peers dial it: "tcp://192.0.2.1:22000 tcp://hub.example.org:22000"
+HUB_LISTEN="tcp://0.0.0.0:22000 quic://0.0.0.0:22000"
+PEER_LISTEN="tcp://127.0.0.1:22000"   # a peer listens on loopback only: it dials, nobody dials it
+PHONE_HOME=no             # no: global and LAN announce, relays, NAT, usage
+                          # reports, upgrade check and crash reports all off
+
+SYNC_USER=""              # who runs Syncthing; empty: the user running --install
+SERVICE=agent             # agent: while that user is logged in; daemon: from
+                          # boot, as that user (installed by --install as root);
+                          # none: started by something else
+## SERVICE_<host>=daemon  # one host differs
+SYNCTHING_HOME=""         # Syncthing's config directory; empty: its default
+CHECK_AGENT=yes           # --install also installs the agent that runs `check`
+CHECK_INTERVAL=5m
+STATE_DIR=""              # my-syncthing's own state; empty: the platform's
+                          # per-user state directory
+
+## check: the conditions that count, and when a held one is told
+CONDITIONS="not-running hub-unreachable folder-error conflicts out-of-sync drift"
+HUB_GRACE=15m             # hub-unreachable counts after this long
+SYNC_GRACE=1h             # out-of-sync counts after this long
+ALERT_NOW=""              # run at once with <subject> <body>, e.g. a desktop notification
+ALERT_LATER=""            # run once if it still holds ALERT_DELAY later, e.g. a mail
+ALERT_DELAY=30m
+
+## the devices, one line each, named by host (`--install` on a new host
+## prints its line):
+##   DEVICE_<host>=XXXXXXX-XXXXXXX-XXXXXXX-XXXXXXX-XXXXXXX-XXXXXXX-XXXXXXX-XXXXXXX
+## the folders, one line each, the folder id after FOLDER_:
+##   FOLDER_<id>="<path> hosts=<hub>,<host>,... [label=<label>]
+##       [versioning=staggered:<N>d|trashcan:<N>d|simple:<N>|none]
+##       [ignore=<pattern>,<pattern>,...] [perms=ignore|sync] [xattrs=off|on]"
+"""
+
+KEYS: Final = ("HUB", "HUB_ADDRESSES", "HUB_LISTEN", "PEER_LISTEN", "PHONE_HOME", "SYNC_USER",
+               "SERVICE", "SYNCTHING_HOME", "CHECK_AGENT", "CHECK_INTERVAL", "STATE_DIR",
+               "CONDITIONS", "HUB_GRACE", "SYNC_GRACE", "ALERT_NOW", "ALERT_LATER", "ALERT_DELAY")
+CONDITION_NAMES: Final = ("not-running", "hub-unreachable", "folder-error", "conflicts",
+                          "out-of-sync", "drift")
+DEVICE_ID: Final = re.compile(r"[A-Z2-7]{7}(-[A-Z2-7]{7}){7}")
+FOLDER_KEYS: Final = ("hosts", "label", "versioning", "ignore", "perms", "xattrs")
+SERVICES: Final = ("agent", "daemon", "none")
+
+
+@dataclass(frozen=True)
+class Folder:
+    id: str
+    path: str
+    hosts: tuple[str, ...]
+    label: str
+    versioning: str                   # "" (none), staggered, trashcan, simple
+    params: tuple[tuple[str, str], ...]
+    ignore: tuple[str, ...]
+    ignore_perms: bool
+    xattrs: bool
+
+
+@dataclass(frozen=True)
+class Config:
+    path: str                         # the file read; "" for the defaults only
+    hub: str
+    hub_addresses: tuple[str, ...]
+    hub_listen: tuple[str, ...]
+    peer_listen: tuple[str, ...]
+    phone_home: bool
+    sync_user: str
+    service: str
+    services: dict[str, str]
+    syncthing_home: str
+    check_agent: bool
+    check_interval: int
+    state_dir: str
+    conditions: tuple[str, ...]
+    hub_grace: int
+    sync_grace: int
+    alert_now: str
+    alert_later: str
+    alert_delay: int
+    devices: dict[str, str]           # host -> device ID
+    folders: dict[str, Folder]
+
+    def service_of(self, host: str) -> str:
+        return self.services.get(host, self.service)
+
+    def name_of(self, device: str) -> str:
+        return next((h for h, d in self.devices.items() if d == device), device[:7])
+
+
+def duration(text: str, what: str) -> int:
+    """30s, 10m, 2h, 3d -> seconds."""
+    m = re.fullmatch(r"([0-9]+)([smhd])", text.strip())
+    if not m:
+        err("00002", f"{what}='{text}': not a duration -- a number and s, m, h or d (30m)")
+    return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def yes(text: str, what: str) -> bool:
+    if text not in ("yes", "no"):
+        err("00003", f"{what}='{text}': yes or no")
+    return text == "yes"
+
+
+def parse_versioning(text: str, what: str) -> tuple[str, tuple[tuple[str, str], ...]]:
+    if text in ("", "none"):
+        return "", ()
+    m = re.fullmatch(r"(staggered|trashcan|simple):([0-9]+)(d?)", text)
+    if not m or (m.group(1) != "simple") != (m.group(3) == "d"):
+        err("00004", f"{what}: versioning='{text}' -- staggered:<N>d, trashcan:<N>d, simple:<N> or none")
+    n = int(m.group(2))
+    kind = m.group(1)
+    if kind == "staggered":
+        return kind, (("maxAge", str(n * 86400)),)
+    if kind == "trashcan":
+        return kind, (("cleanoutDays", str(n)),)
+    return kind, (("keep", str(n)),)
+
+
+def parse_folder(fid: str, spec: str) -> Folder:
+    what = f"FOLDER_{fid}"
+    try:
+        words = shlex.split(spec)
+    except ValueError as e:
+        err("00005", f"{what}: {e}")
+    if not words or "=" in words[0]:
+        err("00006", f"{what}: the first word is the folder's path -- '{spec.strip()}'")
+    kv: dict[str, str] = {}
+    for w in words[1:]:
+        k, eq, v = w.partition("=")
+        if not eq or k not in FOLDER_KEYS:
+            err("00007", f"{what}: '{w}' -- the keys are {', '.join(FOLDER_KEYS)}")
+        kv[k] = v
+    hosts = tuple(h.lower() for h in kv.get("hosts", "").split(",") if h)
+    if not hosts:
+        err("00008", f"{what}: hosts= is required -- which hosts sync it")
+    if kv.get("perms", "ignore") not in ("ignore", "sync"):
+        err("00009", f"{what}: perms='{kv['perms']}' -- ignore or sync")
+    if kv.get("xattrs", "off") not in ("off", "on"):
+        err("00010", f"{what}: xattrs='{kv['xattrs']}' -- off or on")
+    vt, vp = parse_versioning(kv.get("versioning", ""), what)
+    return Folder(id=fid, path=words[0], hosts=hosts, label=kv.get("label", fid), versioning=vt,
+                  params=vp, ignore=tuple(p for p in kv.get("ignore", "").split(",") if p),
+                  ignore_perms=kv.get("perms", "ignore") == "ignore", xattrs=kv.get("xattrs") == "on")
+
+
+def config_search_paths() -> list[str]:
+    """Where the config is looked for, after $MY_SYNCTHING_CONFIG and --config."""
+    links = os.environ.get("LINKS") or "/LINKS"
+    return [f"{links}/default/{NAME}.conf", f"{links}/default/{NAME}",
+            os.path.expanduser(f"~/.{NAME}.conf"), f"/etc/{NAME}.conf", f"/usr/local/etc/{NAME}.conf"]
+
+
+def find_config(named: str) -> str:
+    """The config file in effect: $MY_SYNCTHING_CONFIG, --config, the search."""
+    env = os.environ.get(CONFIG_ENV, "")
+    explicit = env or named
+    if explicit:
+        if not os.path.isfile(explicit):
+            err("00011", f"config file '{explicit}' is not there ({'$' + CONFIG_ENV if env else '--config'})")
+        return explicit
+    found = next((p for p in config_search_paths() if os.path.isfile(p)), "")
+    if found:
+        return found
+    search = config_search_paths()
+    offer = [p for p in (f"/etc/{NAME}.conf", os.path.expanduser(f"~/.{NAME}.conf")) if p in search]
+    err("00012", "no config found -- the cluster (hub, devices, folders) is site-specific;\n"
+        "    --> write one, most common place first (all places: --help):\n"
+        + "\n".join(f"        > {NAME} --create-config > {p}" for p in offer))
+
+
+def read_config(path: str) -> Config:
+    """Source the defaults, then the file, in /bin/sh; read the variables back."""
+    script = ('set -a; eval "$MY_SYNCTHING_DEFAULTS" || exit 3; [ -z "$1" ] || . "$1" || exit 4; '
+              'exec "$2" -I -S -c "import os, json, sys; json.dump(dict(os.environ), sys.stdout)"')
+    env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "USER", "LOGNAME", "LINKS")}
+    env["MY_SYNCTHING_DEFAULTS"] = DEFAULT_CONFIG
+    p = subprocess.run(["/bin/sh", "-c", script, "sh", path, sys.executable], env=env,
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        err("00013", f"the config '{path}' could not be read by /bin/sh [rc {p.returncode}]: "
+            f"{p.stderr.strip() or 'no message'}")
+    raw = cast(dict[str, str], json.loads(p.stdout))
+
+    def v(k: str) -> str:
+        return raw.get(k, "").strip()
+    devices: dict[str, str] = {}
+    folders: dict[str, Folder] = {}
+    services: dict[str, str] = {}
+    for k, val in raw.items():
+        if k.startswith("DEVICE_"):
+            if not DEVICE_ID.fullmatch(val.strip()):
+                err("00014", f"{k}='{val}': not a device ID (8 groups of 7, A-Z and 2-7)")
+            devices[k[len("DEVICE_"):].lower()] = val.strip()
+        elif k.startswith("FOLDER_"):
+            folders[k[len("FOLDER_"):]] = parse_folder(k[len("FOLDER_"):], val)
+        elif k.startswith("SERVICE_"):
+            services[k[len("SERVICE_"):].lower()] = val.strip()
+    for k, s in [("SERVICE", v("SERVICE"))] + [(f"SERVICE_{h}", s) for h, s in services.items()]:
+        if s not in SERVICES:
+            err("00015", f"{k}='{s}' -- {', '.join(SERVICES)}")
+    conds = tuple(v("CONDITIONS").split())
+    for c in conds:
+        if c not in CONDITION_NAMES:
+            err("00016", f"CONDITIONS: '{c}' -- the conditions are {', '.join(CONDITION_NAMES)}")
+    hub = v("HUB").lower()       # host names compare as this_host() gives them
+    for f in folders.values():
+        if hub and hub not in f.hosts:
+            err("00017", f"FOLDER_{f.id}: hosts= lacks the hub '{hub}' -- every folder goes through it")
+    return Config(
+        path=path, hub=hub, hub_addresses=tuple(v("HUB_ADDRESSES").split()),
+        hub_listen=tuple(v("HUB_LISTEN").split()), peer_listen=tuple(v("PEER_LISTEN").split()),
+        phone_home=yes(v("PHONE_HOME"), "PHONE_HOME"), sync_user=v("SYNC_USER"),
+        service=v("SERVICE"), services=services, syncthing_home=v("SYNCTHING_HOME"),
+        check_agent=yes(v("CHECK_AGENT"), "CHECK_AGENT"),
+        check_interval=duration(v("CHECK_INTERVAL"), "CHECK_INTERVAL"), state_dir=v("STATE_DIR"),
+        conditions=conds, hub_grace=duration(v("HUB_GRACE"), "HUB_GRACE"),
+        sync_grace=duration(v("SYNC_GRACE"), "SYNC_GRACE"), alert_now=v("ALERT_NOW"),
+        alert_later=v("ALERT_LATER"), alert_delay=duration(v("ALERT_DELAY"), "ALERT_DELAY"),
+        devices=devices, folders=folders)
+
+
+def create_config(target: str) -> int:
+    """--create-config [FILE]: the defaults on stdout, or into FILE (never over one)."""
+    if not target:
+        sys.stdout.write(DEFAULT_CONFIG)
+        return 0
+    if os.path.lexists(target):
+        err("00018", f"'{target}' exists -- not overwritten; remove it first, or write elsewhere")
+    tmp = f"{target}.{NAME}-{os.getpid()}"
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(DEFAULT_CONFIG)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, target)
+    except OSError as e:
+        err("00019", f"cannot write '{target}': {e.strerror}")
+    out(f"{NAME}: the default config written to {target}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# this host
+
+def this_host() -> str:
+    """The short host name as the config names it: lower case, and anything a
+    shell variable name cannot hold as '_' (My-Laptop: DEVICE_my_laptop)."""
+    return re.sub(r"[^a-z0-9_]", "_", socket.gethostname().split(".")[0].lower())
+
+
+def this_user() -> str:
+    import pwd
+    return pwd.getpwuid(os.getuid()).pw_name
+
+
+def syncthing_home(cfg: Config) -> str:
+    """Syncthing's config directory: the configured one, else its default."""
+    if cfg.syncthing_home:
+        return os.path.expanduser(cfg.syncthing_home)
+    if ON_MAC:
+        return os.path.expanduser("~/Library/Application Support/Syncthing")
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    for d in (os.path.join(state, "syncthing"), os.path.expanduser("~/.config/syncthing")):
+        if os.path.isfile(os.path.join(d, "config.xml")):
+            return d
+    return os.path.join(state, "syncthing")
+
+
+def state_dir(cfg: Config) -> str:
+    return os.path.expanduser(cfg.state_dir) if cfg.state_dir else default_state_dir()
+
+
+def default_state_dir() -> str:
+    """The platform's per-user state directory for this tool."""
+    if ON_MAC:
+        return os.path.expanduser(f"~/Library/Application Support/{NAME}")
+    return os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), NAME)
+
+
+def load_state(cfg: Config) -> dict[str, dict[str, dict[str, float]]]:
+    path = os.path.join(state_dir(cfg), "state.json")
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {"conditions": {}, "disabled": {}}
+    except (OSError, ValueError) as e:
+        err("00020", f"cannot read my state '{path}': {e}")
+    if not isinstance(data, dict):
+        err("00021", f"my state '{path}' is not a JSON object -- remove it, the next run starts afresh")
+    st = cast(dict[str, dict[str, dict[str, float]]], data)
+    st.setdefault("conditions", {})
+    st.setdefault("disabled", {})
+    return st
+
+
+def save_state(cfg: Config, st: dict[str, dict[str, dict[str, float]]]) -> None:
+    """Temp file + rename: an interrupt never leaves half a state."""
+    if OUT.simulate:
+        return
+    d = state_dir(cfg)
+    try:
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".state.")
+        with os.fdopen(fd, "w") as fh:
+            json.dump(st, fh, indent=1, sort_keys=True)
+        os.replace(tmp, os.path.join(d, "state.json"))
+    except OSError as e:
+        err("00022", f"cannot write my state in '{d}': {e.strerror}")
+
+
+# ---------------------------------------------------------------------------
+# Syncthing's REST API -- its key goes in a header, never on a command line
+
+JObj = dict[str, object]
+
+
+def jobj(v: object, what: str) -> JObj:
+    if not isinstance(v, dict):
+        err("00023", f"Syncthing's answer for {what} is not an object")
+    return cast(JObj, v)
+
+
+def jlist(v: object) -> list[object]:
+    return cast(list[object], v) if isinstance(v, list) else []
+
+
+def jstr(o: JObj, k: str) -> str:
+    v = o.get(k)
+    return v if isinstance(v, str) else ""
+
+
+def jint(o: JObj, k: str) -> int:
+    v = o.get(k)
+    return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+
+def jnum(o: JObj, k: str) -> float:
+    v = o.get(k)
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+
+
+@dataclass
+class Api:
+    """One Syncthing instance, found through its own config.xml."""
+    base: str
+    key: str
+    ctx: ssl.SSLContext | None
+    home: str
+
+    def call(self, method: str, path: str, body: object = None) -> object:
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(self.base + path, data=data, method=method,
+                                     headers={"X-API-Key": self.key, "Content-Type": "application/json"})
+        dbg(f"{method} {path}" + (f" {json.dumps(body)}" if body is not None else ""))
+        try:
+            with urllib.request.urlopen(req, context=self.ctx, timeout=20) as r:
+                raw = r.read()
+        except urllib.error.HTTPError as e:
+            err("00024", f"Syncthing refused {method} {path} [HTTP {e.code}]: "
+                f"{e.read().decode(errors='replace').strip()[:200]}")
+        except (urllib.error.URLError, OSError) as e:
+            reason = getattr(e, "reason", e)
+            raise Down("00025", f"Syncthing does not answer at {self.base} [{reason}]") from e
+        if not raw.strip():
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            err("00026", f"Syncthing's answer to {method} {path} is not JSON")
+
+    def get(self, path: str) -> object:
+        return self.call("GET", path)
+
+    def obj(self, path: str) -> JObj:
+        return jobj(self.get(path), path)
+
+    def write(self, change: Change) -> None:
+        if OUT.simulate:
+            out(f"    > (-S) would {change.method} {change.path} {json.dumps(change.body)}")
+            return
+        self.call(change.method, change.path, change.body)
+
+
+def connect(cfg: Config) -> Api:
+    """The API of this user's Syncthing, from its config.xml (address, key, TLS)."""
+    home = syncthing_home(cfg)
+    conf = os.path.join(home, "config.xml")
+    try:
+        gui = ET.parse(conf).getroot().find("gui")
+    except FileNotFoundError as e:
+        raise Down("00027", f"no Syncthing config at {conf} -- not set up for {this_user()}; "
+                   f"`{NAME} --install`") from e
+    except (OSError, ET.ParseError) as e:
+        err("00028", f"cannot read {conf}: {e}")
+    if gui is None:
+        err("00029", f"{conf} has no <gui> element -- Syncthing's API is not configured")
+    addr = (gui.findtext("address") or "").strip()
+    key = (gui.findtext("apikey") or "").strip()
+    if not addr or not key:
+        err("00030", f"{conf}: the GUI address or API key is empty")
+    if addr.startswith("/") or addr.startswith("unix"):
+        err("00031", f"{conf}: GUI address '{addr}' -- a socket; {NAME} needs host:port")
+    tls = gui.get("tls") == "true"
+    ctx: ssl.SSLContext | None = None
+    if tls:
+        # Syncthing's own self-signed certificate is the one to trust here
+        ctx = ssl.create_default_context(cafile=os.path.join(home, "https-cert.pem"))
+        ctx.check_hostname = False
+    host = addr.replace("0.0.0.0", "127.0.0.1").replace("[::]", "[::1]")
+    return Api(base=f"{'https' if tls else 'http'}://{host}", key=key, ctx=ctx, home=home)
+
+
+def wait_up(api: Api, seconds: int) -> None:
+    PHASE[0] = "waiting for Syncthing to answer"
+    end = time.time() + seconds
+    while True:
+        try:
+            api.get("/rest/system/ping")
+            return
+        except Down:
+            if time.time() >= end:
+                raise
+            time.sleep(1)
+
+
+# ---------------------------------------------------------------------------
+# the plan: what --install would change; `check` calls a non-empty one drift
+
+@dataclass(frozen=True)
+class Change:
+    method: str
+    path: str
+    body: object
+    why: str                          # one line: what, and why
+
+
+@dataclass
+class Plan:
+    changes: list[Change] = field(default_factory=lambda: [])
+    notes: list[str] = field(default_factory=lambda: [])
+
+
+PHONE_HOME_OFF: Final[dict[str, object]] = {
+    "globalAnnounceEnabled": False, "localAnnounceEnabled": False, "relaysEnabled": False,
+    "natEnabled": False, "urAccepted": -1, "autoUpgradeIntervalH": 0, "crashReportingEnabled": False}
+
+
+def show(v: object) -> str:
+    return json.dumps(v) if not isinstance(v, str) else v
+
+
+def diff(have: JObj, want: JObj) -> dict[str, object]:
+    return {k: w for k, w in want.items() if have.get(k) != w}
+
+
+def folder_devices(cfg: Config, f: Folder, host: str) -> list[str]:
+    """The hub shares a folder with each of its hosts; a peer with the hub."""
+    peers = [h for h in f.hosts if h != host] if host == cfg.hub else [cfg.hub]
+    return [cfg.devices[h] for h in [host, *peers] if h in cfg.devices]
+
+
+def jsub(o: JObj, k: str) -> JObj:
+    v = o.get(k)
+    return cast(JObj, v) if isinstance(v, dict) else {}
+
+
+def versioning_ok(have: JObj, f: Folder) -> bool:
+    """Equal type, and every parameter we set has our value (Syncthing may add others)."""
+    params = jsub(have, "params")
+    return jstr(have, "type") == f.versioning and all(params.get(k) == v for k, v in f.params)
+
+
+def local_changes(api: Api, fid: str) -> int:
+    o = api.obj(f"/rest/db/localchanged?folder={fid}")
+    return sum(len(jlist(x)) for x in o.values())
+
+
+def make_plan(cfg: Config, api: Api, host: str, my_id: str) -> Plan:
+    p = Plan()
+    is_hub = host == cfg.hub
+    # options: where it listens, and nothing that calls home
+    have = api.obj("/rest/config/options")
+    want: JObj = {"listenAddresses": list(cfg.hub_listen if is_hub else cfg.peer_listen), "startBrowser": False}
+    if not cfg.phone_home:
+        want.update(PHONE_HOME_OFF)
+    d = diff(have, want)
+    if d:
+        p.changes.append(Change("PATCH", "/rest/config/options", d, "options: " + ", ".join(
+            f"{k} {show(have.get(k))} -> {show(v)}" for k, v in d.items())))
+    # devices: the hub knows every device, a peer the hub
+    devs = {jstr(o, "deviceID"): o for o in (jobj(x, "device") for x in jlist(api.get("/rest/config/devices")))}
+    wanted: dict[str, JObj] = {my_id: {"name": host}}
+    for h, dev in cfg.devices.items():
+        if h != host and (is_hub or h == cfg.hub):
+            wanted[dev] = {"name": h, "autoAcceptFolders": False,
+                           "addresses": ["dynamic"] if is_hub else list(cfg.hub_addresses)}
+    for dev, w in wanted.items():
+        if dev not in devs:
+            p.changes.append(Change("PUT", f"/rest/config/devices/{dev}", {"deviceID": dev, **w},
+                                    f"device {w['name']}: added ({'a peer of this hub' if is_hub else 'the hub'})"))
+        elif diff(devs[dev], w):
+            dd = diff(devs[dev], w)
+            p.changes.append(Change("PATCH", f"/rest/config/devices/{dev}", dd, f"device {w['name']}: " + ", ".join(
+                f"{k} {show(devs[dev].get(k))} -> {show(v)}" for k, v in dd.items())))
+    for dev in devs:
+        if dev not in wanted:
+            p.notes.append(f"device {jstr(devs[dev], 'name') or dev[:7]} [{dev[:7]}]: not in the config "
+                           f"for this host -- left as it is")
+    # folders this host is named in
+    have_f = {jstr(o, "id"): o for o in (jobj(x, "folder") for x in jlist(api.get("/rest/config/folders")))}
+    home = os.path.expanduser("~")
+    for f in sorted(cfg.folders.values(), key=lambda x: x.id):
+        if host not in f.hosts:
+            continue
+        missing = [h for h in f.hosts if h not in cfg.devices]
+        if missing:
+            p.notes.append(f"folder {f.id}: no DEVICE_ line for {', '.join(missing)} -- not shared with them yet")
+        path = os.path.join(home, f.path[2:]) if f.path.startswith("~/") else f.path
+        want_f: JObj = {
+            "label": f.label, "path": path,
+            "versioning": {"type": f.versioning, "params": dict(f.params)},
+            "ignorePerms": f.ignore_perms, "syncXattrs": f.xattrs, "sendXattrs": f.xattrs,
+            "syncOwnership": False, "sendOwnership": False}
+        devices = folder_devices(cfg, f, host)
+        if f.id not in have_f:
+            try:
+                full = bool(os.listdir(path))
+            except FileNotFoundError:
+                full = False
+            except OSError:
+                full = True              # unreadable: assume data, so nothing is sent before it matches
+            kind = "receiveonly" if full else "sendreceive"
+            p.changes.append(Change("PUT", f"/rest/config/folders/{f.id}", {
+                "id": f.id, "type": kind, "paused": True,
+                "devices": [{"deviceID": x} for x in devices], **want_f},
+                f"folder {f.id}: added at {path}, {kind}" + (
+                    " -- it already holds data: nothing is sent until it matches the others" if full else "")))
+            p.changes.append(Change("POST", f"/rest/db/ignores?folder={f.id}", {"ignore": list(f.ignore)},
+                                    f"folder {f.id}: ignores {', '.join(f.ignore) or 'none'}"))
+            p.changes.append(Change("PATCH", f"/rest/config/folders/{f.id}", {"paused": False},
+                                    f"folder {f.id}: started, its ignores in place"))
+            continue
+        h = have_f[f.id]
+        dd: JObj = {k: w for k, w in want_f.items() if k != "versioning" and h.get(k) != w}
+        if not versioning_ok(jsub(h, "versioning"), f):
+            dd["versioning"] = want_f["versioning"]
+        have_devs = sorted(jstr(jobj(x, "folder device"), "deviceID") for x in jlist(h.get("devices")))
+        if have_devs != sorted(devices):
+            dd["devices"] = [{"deviceID": x} for x in devices]
+        if dd:
+            p.changes.append(Change("PATCH", f"/rest/config/folders/{f.id}", dd, f"folder {f.id}: " + ", ".join(
+                f"{k} -> {show(v) if k != 'devices' else ', '.join(cfg.name_of(x) for x in devices)}"
+                for k, v in dd.items())))
+        ign = jlist(api.obj(f"/rest/db/ignores?folder={f.id}").get("ignore"))
+        if [x for x in ign if isinstance(x, str)] != list(f.ignore):
+            p.changes.append(Change("POST", f"/rest/db/ignores?folder={f.id}", {"ignore": list(f.ignore)},
+                                    f"folder {f.id}: ignores -> {', '.join(f.ignore) or 'none'}"))
+        if jstr(h, "type") == "receiveonly" and h.get("paused") is not True:
+            st = jstr(api.obj(f"/rest/db/status?folder={f.id}"), "state")
+            n = local_changes(api, f.id)
+            if st == "idle" and n == 0:
+                p.changes.append(Change("PATCH", f"/rest/config/folders/{f.id}", {"type": "sendreceive"},
+                                        f"folder {f.id}: receiveonly -> sendreceive (scanned, nothing differs here)"))
+            else:
+                p.notes.append(f"folder {f.id}: stays receiveonly -- {n} local change(s), state {st} "
+                               f"(`{NAME} diag localchanged`)")
+    for fid in have_f:
+        if fid not in cfg.folders or host not in cfg.folders[fid].hosts:
+            p.notes.append(f"folder {fid}: not in the config for this host -- left as it is")
+    return p
+
+
+# ---------------------------------------------------------------------------
+# facts and conditions -- what status and check report
+
+@dataclass
+class FolderFacts:
+    id: str
+    label: str
+    path: str
+    type: str
+    paused: bool
+    state: str
+    need_bytes: int
+    global_bytes: int
+    errors: int
+    conflicts: int
+    remotes: list[tuple[str, float, str]]   # name, completion %, remote state
+    changed: str                            # when its state last changed
+    files: tuple[int, int]                  # local, global
+
+
+@dataclass
+class Facts:
+    host: str
+    my_id: str
+    version: str
+    uptime: int
+    conns: dict[str, JObj]
+    folders: list[FolderFacts]
+    plan: Plan | None                  # None: this host is not in the config yet
+    api: str                           # where its REST API answered
+
+
+def count_conflicts(path: str) -> int:
+    n = 0
+    for _d, dirs, files in os.walk(path):
+        if ".stversions" in dirs:
+            dirs.remove(".stversions")
+        n += sum(1 for x in files if ".sync-conflict-" in x)
+    return n
+
+
+def conflict_names(path: str) -> list[str]:
+    found: list[str] = []
+    for d, dirs, files in os.walk(path):
+        if ".stversions" in dirs:
+            dirs.remove(".stversions")
+        found += [os.path.join(d, x) for x in files if ".sync-conflict-" in x]
+    return sorted(found)
+
+
+def gather(cfg: Config, api: Api, host: str) -> Facts:
+    PHASE[0] = "reading Syncthing's state"
+    st = api.obj("/rest/system/status")
+    my_id = jstr(st, "myID")
+    version = jstr(api.obj("/rest/system/version"), "version")
+    conns = {k: jobj(v, "connection") for k, v in jobj(api.obj("/rest/system/connections").get("connections"),
+                                                        "connections").items()}
+    folders: list[FolderFacts] = []
+    for fo in sorted((jobj(x, "folder") for x in jlist(api.get("/rest/config/folders"))),
+                     key=lambda o: jstr(o, "id")):
+        fid = jstr(fo, "id")
+        ds = api.obj(f"/rest/db/status?folder={fid}")
+        errs = len(jlist(api.obj(f"/rest/folder/errors?folder={fid}").get("errors")))
+        remotes: list[tuple[str, float, str]] = []
+        for x in jlist(fo.get("devices")):
+            dev = jstr(jobj(x, "folder device"), "deviceID")
+            if dev and dev != my_id:
+                c = api.obj(f"/rest/db/completion?folder={fid}&device={dev}")
+                remotes.append((cfg.name_of(dev), jnum(c, "completion"), jstr(c, "remoteState")))
+        path = jstr(fo, "path")
+        folders.append(FolderFacts(
+            id=fid, label=jstr(fo, "label"), path=path, type=jstr(fo, "type"), paused=fo.get("paused") is True,
+            state=jstr(ds, "state"), need_bytes=jint(ds, "needBytes"), global_bytes=jint(ds, "globalBytes"),
+            errors=errs + (1 if jstr(ds, "state") == "error" else 0),
+            changed=jstr(ds, "stateChanged"), files=(jint(ds, "localFiles"), jint(ds, "globalFiles")),
+            conflicts=count_conflicts(path) if "conflicts" in cfg.conditions and os.path.isdir(path) else 0,
+            remotes=remotes))
+    plan = make_plan(cfg, api, host, my_id) if cfg.devices.get(host) == my_id else None
+    return Facts(host=host, my_id=my_id, version=version, uptime=jint(st, "uptime"), conns=conns, api=api.base,
+                 folders=folders, plan=plan)
+
+
+@dataclass(frozen=True)
+class Condition:
+    name: str
+    detail: str
+    grace: int = 0
+
+
+def conditions(cfg: Config, f: Facts) -> list[Condition]:
+    found: list[Condition] = []
+    if f.host != cfg.hub and cfg.hub in cfg.devices:
+        c = f.conns.get(cfg.devices[cfg.hub], {})
+        if c.get("connected") is not True:
+            found.append(Condition("hub-unreachable", f"hub {cfg.hub} not connected [{', '.join(cfg.hub_addresses)}]",
+                                   cfg.hub_grace))
+    for fo in f.folders:
+        if fo.paused:
+            continue
+        if fo.errors:
+            found.append(Condition("folder-error", f"{fo.id}: {fo.errors} error(s), state {fo.state} "
+                                   f"(`{NAME} diag errors`)"))
+        if fo.conflicts:
+            found.append(Condition("conflicts", f"{fo.id}: {fo.conflicts} *.sync-conflict-* file(s) "
+                                   f"(`{NAME} -V status` names them)"))
+        if fo.need_bytes:
+            found.append(Condition("out-of-sync", f"{fo.id}: needs {human(fo.need_bytes)} [state {fo.state}]",
+                                   cfg.sync_grace))
+    if f.plan is None:
+        found.append(Condition("drift", f"this host is not in the config: DEVICE_{f.host}={f.my_id}"))
+    elif f.plan.changes:
+        found.append(Condition("drift", f"{len(f.plan.changes)} setting(s) not as configured: "
+                               + "; ".join(c.why for c in f.plan.changes)))
+    return [c for c in found if c.name in cfg.conditions]
+
+
+def human(n: int) -> str:
+    v = float(n)
+    for unit in ("B", "kB", "MB", "GB", "TB"):
+        if v < 1000 or unit == "TB":
+            return f"{v:.0f} {unit}" if unit == "B" else f"{v:.1f} {unit}"
+        v /= 1000
+    return f"{n} B"
+
+
+def ago(seconds: int) -> str:
+    d, r = divmod(seconds, 86400)
+    h, r = divmod(r, 3600)
+    return f"{d}d {h}h" if d else f"{h}h {r // 60}m"
+
+
+def when(iso: str) -> str:
+    return iso[:16].replace("T", " ") if iso else "?"
+
+
+def render(cfg: Config, f: Facts, st: dict[str, dict[str, dict[str, float]]]) -> None:
+    role = "hub" if f.host == cfg.hub else f"peer, hub {cfg.hub or '?'}"
+    out(f" >>> {f.host} ({role}): Syncthing {f.version}, up {ago(f.uptime)} [id {f.my_id[:7]}]")
+    if OUT.vrb:
+        out(f"    > config {cfg.path}; Syncthing's {syncthing_home(cfg)}/config.xml; API {f.api}")
+    if f.host == cfg.hub:
+        for h, dev in sorted(cfg.devices.items()):
+            if h == f.host:
+                continue
+            c = f.conns.get(dev, {})
+            out(f"   > {h}: " + (f"connected via {jstr(c, 'address')} since {when(jstr(c, 'startedAt'))} "
+                                 f"[{jstr(c, 'type')}]" if c.get("connected") is True else "NOT connected"))
+    elif cfg.hub in cfg.devices:
+        c = f.conns.get(cfg.devices[cfg.hub], {})
+        out(f"    > hub {cfg.hub}: " + (f"connected via {jstr(c, 'address')} since {when(jstr(c, 'startedAt'))} "
+                                       f"[{jstr(c, 'type')}]" if c.get("connected") is True else
+                                       f"NOT connected [dials {', '.join(cfg.hub_addresses) or 'nothing'}]"))
+    for fo in f.folders:
+        if fo.paused:
+            since = st["disabled"].get(fo.id, {}).get("at")
+            at = time.strftime(" since %Y-%m-%d %H:%M", time.localtime(since)) if since else ""
+            out(f" >>> folder {fo.id} ({fo.path}): DISABLED here{at} [paused=true] -- `{NAME} enable {fo.id}`")
+            continue
+        sync = "in sync" if fo.need_bytes == 0 else f"needs {human(fo.need_bytes)}"
+        out(f" >>> folder {fo.id} ({fo.path}): {fo.state}, {sync} [{fo.type}; "
+            f"{human(fo.global_bytes)}; {fo.errors} error(s); {fo.conflicts} conflict(s)]")
+        for name, pct, rs in fo.remotes:
+            out(f"    > {name}: {pct:.0f}% [{rs or '?'}]")
+        if OUT.vrb:
+            out(f"    > files: {fo.files[0]} here, {fo.files[1]} in the cluster; state since {when(fo.changed)}")
+        if OUT.vrb and fo.conflicts:
+            for x in conflict_names(fo.path):
+                out(f"   > {x}")
+    for fid, fd in sorted(cfg.folders.items()):
+        if f.host in fd.hosts and fid not in {x.id for x in f.folders}:
+            out(f" >>> folder {fid} ({fd.path}): NOT set up here -- `{NAME} --install`")
+    if f.plan is None:
+        out(f" >>> settings: this host is not in the config -- add DEVICE_{f.host}={f.my_id}")
+    elif f.plan.changes:
+        out(f" >>> settings: {len(f.plan.changes)} change(s) `--install` would make:")
+        for c in f.plan.changes:
+            out(f"   > {c.why}")
+    else:
+        out(" >>> settings: as configured [0 changes]")
+    if OUT.vrb and f.plan is not None:
+        for n in f.plan.notes:
+            out(f"    > {n}")
+
+
+def report(conds: Sequence[Condition]) -> int:
+    for c in conds:
+        sys.stderr.write(f"!!! {c.name}: {c.detail}\n")
+    if conds:
+        out(f" >>> {len(conds)} condition(s): {', '.join(sorted({c.name for c in conds}))}")
+        return 1
+    out(" >>> healthy [0 conditions]")
+    return 0
+
+
+def cmd_status(cfg: Config) -> int:
+    host = this_host()
+    st = load_state(cfg)
+    try:
+        api = connect(cfg)
+        facts = gather(cfg, api, host)
+    except Down as e:
+        out(f" >>> {host}: Syncthing NOT running")
+        return report([c for c in [Condition("not-running", e.msg)] if c.name in cfg.conditions])
+    render(cfg, facts, st)
+    return report(conditions(cfg, facts))
+
+
+# ---------------------------------------------------------------------------
+# check: the conditions, each told at once and -- still there later -- once more
+
+def alert(cmd: str, subject: str, body: str) -> None:
+    if not cmd:
+        return
+    try:
+        argv = shlex.split(cmd) + [subject, body]
+    except ValueError as e:
+        err("00032", f"the alert command '{cmd}': {e}")
+    p = run(argv, "the alert", changes=True)
+    if p.returncode != 0:
+        warn(f"the alert '{cmd}' failed [rc {p.returncode}]: {(p.stderr or p.stdout).strip()[:200]}")
+
+
+def cmd_check(cfg: Config) -> int:
+    host = this_host()
+    st = load_state(cfg)
+    try:
+        conds = conditions(cfg, gather(cfg, connect(cfg), host))
+    except Down as e:
+        conds = [c for c in [Condition("not-running", e.msg)] if c.name in cfg.conditions]
+    PHASE[0] = "telling the conditions"
+    now = time.time()
+    held: list[Condition] = []
+    seen = st["conditions"]
+    for c in conds:
+        rec = seen.setdefault(c.name, {"first": now})
+        if now - rec["first"] < c.grace:
+            continue
+        held.append(c)
+        subject = f"{NAME} {host}: {c.name}"
+        if not rec.get("now"):
+            alert(cfg.alert_now, subject, c.detail)
+            rec["now"] = now
+        if not rec.get("later") and now - rec["first"] - c.grace >= cfg.alert_delay:
+            alert(cfg.alert_later, subject, f"{c.detail}\n\nsince "
+                  + time.strftime("%Y-%m-%d %H:%M", time.localtime(rec["first"] + c.grace)))
+            rec["later"] = now
+    for name in [n for n in seen if n not in {c.name for c in conds}]:
+        if seen[name].get("now"):
+            alert(cfg.alert_now, f"{NAME} {host}: {name} cleared", "")
+        del seen[name]
+    save_state(cfg, st)
+    return report(held)
+
+
+def cmd_test_mail(cfg: Config) -> int:
+    if not cfg.alert_later:
+        err("00033", "ALERT_LATER is empty -- nothing would be sent; set it in the config "
+            f"({cfg.path or 'none found'})")
+    body = (f"host {this_host()}, user {this_user()}, {time.strftime('%Y-%m-%d %H:%M %Z')}, "
+            f"config {cfg.path}")
+    argv = shlex.split(cfg.alert_later) + [f"{NAME} {this_host()}: TEST mail", body]
+    p = run(argv, "the test mail")
+    if p.returncode != 0:
+        err("00034", f"the test mail was NOT sent: {cfg.alert_later} [rc {p.returncode}] "
+            f"{(p.stderr or p.stdout).strip()[:200]}")
+    out(f" >>> test mail sent through {cfg.alert_later} [rc 0]")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# enable / disable a folder on this host: Syncthing's own `paused` flag
+
+def cmd_pause(cfg: Config, args: list[str], paused: bool) -> int:
+    api = connect(cfg)
+    have = {jstr(o, "id"): o for o in (jobj(x, "folder") for x in jlist(api.get("/rest/config/folders")))}
+    names = args or sorted(have)
+    unknown = [n for n in names if n not in have]
+    if unknown:
+        err("00035", f"no folder {', '.join(unknown)} on this host -- it has: {', '.join(sorted(have)) or 'none'}")
+    st = load_state(cfg)
+    verb = "disabled" if paused else "enabled"
+    for n in names:
+        if (have[n].get("paused") is True) == paused:
+            out(f" >>> folder {n}: already {verb} here [paused={'true' if paused else 'false'}]")
+            continue
+        api.write(Change("PATCH", f"/rest/config/folders/{n}", {"paused": paused}, ""))
+        if paused:
+            st["disabled"][n] = {"at": time.time()}
+        else:
+            st["disabled"].pop(n, None)
+        out(f" >>> folder {n}: {verb} here [paused={'true' if paused else 'false'}]" + (
+            f" -- the other hosts go on; `{NAME} enable {n}` syncs it again" if paused else ""))
+    save_state(cfg, st)
+    return 0
+
+
+def cmd_web(cfg: Config) -> int:
+    api = connect(cfg)
+    opener = "open" if ON_MAC else "xdg-open"
+    if not shutil.which(opener):
+        err("00036", f"no '{opener}' to open {api.base}/ -- open it in a browser yourself")
+    p = run([opener, api.base + "/"], "the web UI")
+    if p.returncode != 0:
+        err("00037", f"{opener} {api.base}/ failed [rc {p.returncode}]")
+    out(f" >>> opened {api.base}/")
+    return 0
+
+
+DIAG: Final = ("plan", "folders", "connections", "conflicts", "errors", "localchanged", "ignores", "config",
+               "complete")
+
+
+def cmd_diag(cfg: Config, args: list[str]) -> int:
+    if not args:
+        out(f"the blocks: {', '.join(DIAG)}")
+        return 0
+    block, rest = args[0], args[1:]
+    if block == "config":
+        out(f"# {cfg.path}")
+        for k in sorted(vars(cfg)):
+            out(f"{k}={getattr(cfg, k)!r}")
+        return 0
+    api = connect(cfg)
+    folders = [jobj(x, "folder") for x in jlist(api.get("/rest/config/folders"))]
+    ids = [f for f in sorted(jstr(o, "id") for o in folders) if not rest or f in rest]
+    if block == "complete":
+        sys.stdout.write("".join(f"{i}\n" for i in ids))
+    elif block == "plan":
+        my_id = jstr(api.obj("/rest/system/status"), "myID")
+        if cfg.devices.get(this_host()) != my_id:
+            out(f"this host is not in the config: DEVICE_{this_host()}={my_id}")
+            return 1
+        p = make_plan(cfg, api, this_host(), my_id)
+        for c in p.changes:
+            out(f"{c.why}\n    {c.method} {c.path} {json.dumps(c.body)}")
+        for n in p.notes:
+            out(f"note: {n}")
+    elif block == "connections":
+        out(json.dumps(api.get("/rest/system/connections"), indent=1))
+    elif block == "folders":
+        out(json.dumps([o for o in folders if jstr(o, "id") in ids], indent=1))
+    else:
+        for fid in ids:
+            path = next(jstr(o, "path") for o in folders if jstr(o, "id") == fid)
+            if block == "conflicts":
+                for x in conflict_names(path):
+                    out(x)
+            elif block == "errors":
+                out(json.dumps(api.get(f"/rest/folder/errors?folder={fid}"), indent=1))
+            elif block == "localchanged":
+                out(json.dumps(api.get(f"/rest/db/localchanged?folder={fid}"), indent=1))
+            elif block == "ignores":
+                out(f"# {fid}\n" + "\n".join(x for x in jlist(api.obj(f"/rest/db/ignores?folder={fid}")
+                                                                .get("ignore")) if isinstance(x, str)))
+            else:
+                err("00038", f"diag: no block '{block}' -- {', '.join(DIAG)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# --install / --uninstall: this host as the config says
+
+LABEL: Final = f"{NAME}.syncthing"
+CHECK_LABEL: Final = f"{NAME}.check"
+
+
+def syncthing_bin() -> str:
+    return shutil.which("syncthing") or ""
+
+
+def write_file(path: str, data: bytes, why: str) -> bool:
+    """Write only when it differs; temp file + rename. True when it changed."""
+    try:
+        with open(path, "rb") as fh:
+            if fh.read() == data:
+                return False
+    except FileNotFoundError:
+        pass
+    out(f"    > {path} ({why})")
+    if OUT.simulate:
+        return True
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp.")
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+    return True
+
+
+def serve_args(cfg: Config, binary: str) -> list[str]:
+    return [binary, "serve", "--no-browser", "--no-restart"] + (
+        [f"--home={os.path.expanduser(cfg.syncthing_home)}"] if cfg.syncthing_home else [])
+
+
+def launchd_load(domain: str, label: str, path: str, changed: bool) -> None:
+    loaded = run(["launchctl", "print", f"{domain}/{label}"]).returncode == 0
+    if loaded and not changed:
+        return
+    if loaded:
+        run(["launchctl", "bootout", f"{domain}/{label}"], "reload: its file changed", changes=True)
+    p = run(["launchctl", "bootstrap", domain, path], "start it", changes=True)
+    if p.returncode != 0:
+        err("00039", f"launchctl bootstrap {domain} {path} failed [rc {p.returncode}]: {p.stderr.strip()}")
+
+
+def plist(label: str, argv: list[str], extra: JObj) -> bytes:
+    d: JObj = {"Label": label, "ProgramArguments": argv,
+               "EnvironmentVariables": {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}}
+    d.update(extra)
+    return plistlib.dumps(d)
+
+
+def install_daemon(cfg: Config) -> int:
+    """As root: only the boot-time service, run as SYNC_USER."""
+    host = this_host()
+    if cfg.service_of(host) != "daemon":
+        err("00040", f"SERVICE for {host} is '{cfg.service_of(host)}', not daemon -- run --install as the "
+            f"user{' ' + cfg.sync_user if cfg.sync_user else ''}, not as root")
+    if not cfg.sync_user:
+        err("00041", "SYNC_USER is empty -- a daemon needs to know whose Syncthing it runs")
+    import pwd
+    try:
+        pw = pwd.getpwnam(cfg.sync_user)
+    except KeyError:
+        err("00042", f"SYNC_USER='{cfg.sync_user}': no such user on {host}")
+    binary = syncthing_bin()
+    if not binary:
+        err("00043", f"no syncthing on PATH -- run `{NAME} --install` as {cfg.sync_user} first (it installs it)")
+    PHASE[0] = "installing the boot-time service"
+    out(f" >>> {host}: Syncthing from boot, as {cfg.sync_user} (SERVICE=daemon)")
+    if ON_MAC:
+        path = f"/Library/LaunchDaemons/{LABEL}.plist"
+        data = plist(LABEL, serve_args(cfg, binary), {
+            "UserName": cfg.sync_user, "RunAtLoad": True, "KeepAlive": True, "ProcessType": "Background",
+            "EnvironmentVariables": {"HOME": pw.pw_dir, "PATH": os.environ.get("PATH", "/usr/bin:/bin")}})
+        changed = write_file(path, data, "the daemon, run as " + cfg.sync_user)
+        if changed and not OUT.simulate:
+            os.chown(path, 0, 0)
+        launchd_load("system", LABEL, path, changed)
+    else:
+        unit = f"syncthing@{cfg.sync_user}.service"
+        if run(["systemctl", "is-enabled", unit]).stdout.strip() != "enabled" or \
+                run(["systemctl", "is-active", unit]).stdout.strip() != "active":
+            p = run(["systemctl", "enable", "--now", unit], "the daemon, run as " + cfg.sync_user, changes=True)
+            if p.returncode != 0:
+                err("00044", f"systemctl enable --now {unit} failed [rc {p.returncode}]: {p.stderr.strip()}")
+    out(f" >>> done -- now `{NAME} --install` as {cfg.sync_user}")
+    return 0
+
+
+def app_running() -> bool:
+    """macOS: Syncthing.app's own syncthing -- it would fight the service for the same config."""
+    return ON_MAC and run(["pgrep", "-f", "Syncthing.app/Contents/Resources/syncthing/syncthing"]).returncode == 0
+
+
+def ensure_service(cfg: Config, kind: str) -> bool:
+    """Syncthing installed, its identity there, its service running. True when started now."""
+    PHASE[0] = "installing Syncthing"
+    binary = syncthing_bin()
+    if not binary:
+        brew = shutil.which("brew") if ON_MAC else ""
+        if not brew:
+            err("00045", "syncthing is not installed -- install the 'syncthing' package "
+                "(it needs root here), then run --install again")
+        p = run([brew, "install", "syncthing"], "Syncthing is not installed", capture=False, changes=True)
+        if p.returncode != 0:
+            err("00046", f"brew install syncthing failed [rc {p.returncode}]")
+        binary = syncthing_bin() or "syncthing"
+        out(f"    > syncthing installed (it was missing) [{binary}]")
+    if app_running():
+        err("00047", "Syncthing.app is running -- quit it (menu bar icon > Quit) and remove it from "
+            "System Settings > General > Login Items, then run --install again: the service replaces it "
+            "and uses the same config, so this device keeps its identity")
+    home = syncthing_home(cfg)
+    if not os.path.isfile(os.path.join(home, "cert.pem")):
+        p = run([binary, "generate"] + ([f"--home={home}"] if cfg.syncthing_home else []),
+                "this device's identity", changes=True)
+        if p.returncode != 0:
+            err("00048", f"syncthing generate failed [rc {p.returncode}]: {p.stderr.strip()}")
+        out(f"    > {home}: identity and config created (there was none)")
+    if kind == "daemon":
+        ok = run(["launchctl", "print", f"system/{LABEL}"]).returncode == 0 if ON_MAC else \
+            run(["systemctl", "is-active", f"syncthing@{this_user()}.service"]).stdout.strip() == "active"
+        if not ok:
+            err("00049", f"SERVICE=daemon: the boot-time service is not installed -- needs root, once:\n"
+                f"        > {NAME} --install          (as root)\n    then `{NAME} --install` again as {this_user()}")
+        return False
+    if ON_MAC:
+        path = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
+        log = os.path.join(state_dir(cfg), "syncthing.log")
+        changed = write_file(path, plist(LABEL, serve_args(cfg, binary), {
+            "RunAtLoad": True, "KeepAlive": True, "ProcessType": "Background",
+            "StandardOutPath": log, "StandardErrorPath": log}), "Syncthing while you are logged in")
+        if not OUT.simulate:
+            os.makedirs(state_dir(cfg), exist_ok=True)
+        before = run(["launchctl", "print", f"gui/{os.getuid()}/{LABEL}"]).returncode == 0
+        launchd_load(f"gui/{os.getuid()}", LABEL, path, changed)
+        return changed or not before
+    unit = "syncthing.service"
+    if run(["systemctl", "--user", "is-active", unit]).stdout.strip() == "active":
+        return False
+    p = run(["systemctl", "--user", "enable", "--now", unit], "Syncthing while you are logged in", changes=True)
+    if p.returncode != 0:
+        err("00050", f"systemctl --user enable --now {unit} failed [rc {p.returncode}]: {p.stderr.strip()}")
+    return True
+
+
+def ensure_check_agent(cfg: Config) -> None:
+    PHASE[0] = "installing the check agent"
+    me = os.path.abspath(sys.argv[0])
+    argv = [me, "check", "-Q"] + (["--config", cfg.path] if cfg.path else [])
+    if ON_MAC:
+        path = os.path.expanduser(f"~/Library/LaunchAgents/{CHECK_LABEL}.plist")
+        changed = write_file(path, plist(CHECK_LABEL, argv, {"StartInterval": cfg.check_interval, "RunAtLoad": True}),
+                             f"runs `check` every {cfg.check_interval}s")
+        launchd_load(f"gui/{os.getuid()}", CHECK_LABEL, path, changed)
+        return
+    d = os.path.expanduser("~/.config/systemd/user")
+    a = write_file(os.path.join(d, f"{CHECK_LABEL}.service"),
+                   f"[Unit]\nDescription={NAME} check\n\n[Service]\nType=oneshot\nExecStart={shlex.join(argv)}\n"
+                   .encode(), "runs `check`")
+    b = write_file(os.path.join(d, f"{CHECK_LABEL}.timer"),
+                   f"[Unit]\nDescription={NAME} check\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec="
+                   f"{cfg.check_interval}s\n\n[Install]\nWantedBy=timers.target\n".encode(),
+                   f"every {cfg.check_interval}s")
+    if a or b:
+        run(["systemctl", "--user", "daemon-reload"], "the units changed", changes=True)
+        run(["systemctl", "--user", "enable", "--now", f"{CHECK_LABEL}.timer"], "start it", changes=True)
+
+
+def cmd_install(cfg: Config) -> int:
+    host = this_host()
+    if os.getuid() == 0:
+        return install_daemon(cfg)
+    user = this_user()
+    if cfg.sync_user and cfg.sync_user != user:
+        err("00051", f"SYNC_USER is '{cfg.sync_user}', this is '{user}' -- run --install as {cfg.sync_user}")
+    if not cfg.hub:
+        err("00052", f"HUB is empty -- the config ({cfg.path}) names no hub")
+    kind = cfg.service_of(host)
+    out(f" >>> {host} ({'hub' if host == cfg.hub else 'peer'}; SERVICE={kind}) as {user}")
+    started = ensure_service(cfg, kind) if kind != "none" else False
+    api = connect(cfg)
+    wait_up(api, 60 if started else 5)
+    PHASE[0] = "comparing this host with the config"
+    my_id = jstr(api.obj("/rest/system/status"), "myID")
+    if host not in cfg.devices:
+        lacking = [f.id for f in cfg.folders.values() if host not in f.hosts]
+        out(f" >>> {host} is not in the config yet -- add, in {cfg.path}:")
+        out(f"        DEVICE_{host}={my_id}")
+        if lacking:
+            out(f"    > and '{host}' to hosts= of the folder(s) it should sync: {', '.join(sorted(lacking))}")
+        out(f"    > then `{NAME} --install` here, and on the hub {cfg.hub}")
+        return 1
+    if cfg.devices[host] != my_id:
+        err("00053", f"this device's ID is {my_id}, the config says DEVICE_{host}={cfg.devices[host]} -- "
+            f"a new identity? Fix the config line; never copy cert.pem/key.pem between hosts")
+    if host != cfg.hub and cfg.hub not in cfg.devices:
+        err("00054", f"the hub {cfg.hub} has no DEVICE_ line -- its --install prints it")
+    PHASE[0] = "making this host match the config"
+    plan = make_plan(cfg, api, host, my_id)
+    for c in plan.changes:
+        out(f"    > {c.why}")
+        api.write(c)
+    for n in plan.notes:
+        out(f"    > {n}")
+    if cfg.check_agent:
+        ensure_check_agent(cfg)
+    made = "would be made (-S)" if OUT.simulate else "made"
+    out(f" >>> {'nothing to change: as configured' if not plan.changes else f'{len(plan.changes)} change(s) {made}'}"
+        f" [{len(plan.changes)}]")
+    return 0
+
+
+def cmd_uninstall(cfg: Config) -> int:
+    """The check agent and this user's Syncthing service go; data and identity stay."""
+    if ON_MAC:
+        for label in (CHECK_LABEL, LABEL):
+            path = os.path.expanduser(f"~/Library/LaunchAgents/{label}.plist")
+            if run(["launchctl", "print", f"gui/{os.getuid()}/{label}"]).returncode == 0:
+                run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], "stop it", changes=True)
+            if os.path.exists(path):
+                out(f"    > {path} removed")
+                if not OUT.simulate:
+                    os.remove(path)
+        if run(["launchctl", "print", f"system/{LABEL}"]).returncode == 0:
+            out(f"    > the boot-time service stays -- root removes it: launchctl bootout system/{LABEL} "
+                f"&& rm /Library/LaunchDaemons/{LABEL}.plist")
+    else:
+        run(["systemctl", "--user", "disable", "--now", f"{CHECK_LABEL}.timer", "syncthing.service"],
+            "stop them", changes=True)
+    out(f" >>> uninstalled: the check agent and the service -- the folders and {syncthing_home(cfg)} stay")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# --version, the stamp, the zsh completion
+
+def build_id() -> str:
+    """A hash of the running file: two installs compare by their --version."""
+    with open(os.path.realpath(__file__), "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()[:12]
+
+
+def version_string() -> str:
+    here = os.path.dirname(os.path.realpath(__file__))
+    desc = ""
+    if shutil.which("git"):
+        p = subprocess.run(["git", "-C", here, "describe", "--tags", "--long"], capture_output=True, text=True)
+        desc = p.stdout.strip() if p.returncode == 0 else ""
+    desc = desc or SCRIPT_RELEASE
+    m = re.fullmatch(r"(.+)-([0-9]+)-g([0-9a-f]+)", desc)
+    if m:
+        n = int(m.group(2))
+        what = f"the {m.group(1)} tag" if n == 0 else f"{n} commit(s) past {m.group(1)}, unreleased"
+        return f"{NAME} {VERSION}{'' if n == 0 else f'+{n}'} ({desc}: {what}, build {build_id()})"
+    if SCRIPT_COMMIT:
+        return f"{NAME} {VERSION} (commit {SCRIPT_COMMIT}, build {build_id()})"
+    return f"{NAME} {VERSION} (build {build_id()}, unstamped)"
+
+
+def stamp_version() -> int:
+    """Record HEAD and git's describe string in this file, then AMEND the
+    commit that carries it. After committing, BEFORE pushing; tag afterwards.
+    The stamped sha lags HEAD by one: a commit cannot contain its own sha."""
+    me = os.path.realpath(__file__)
+    here, rel = os.path.dirname(me), os.path.basename(me)
+
+    def git(*a: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", "-C", here, *a], capture_output=True, text=True)
+
+    if git("rev-parse", "--git-dir").returncode != 0:
+        err("00055", "--stamp-version: not a git checkout")
+    if git("rev-parse", "--abbrev-ref", "@{upstream}").returncode == 0 and \
+            git("merge-base", "--is-ancestor", "HEAD", "@{upstream}").returncode == 0:
+        err("00056", "--stamp-version: HEAD is already pushed -- amending would rewrite published history")
+    if not git("show", "--name-only", "--format=", "HEAD", "--", rel).stdout.strip():
+        err("00057", "--stamp-version: HEAD does not touch this file -- commit it first")
+    staged = git("diff", "--cached", "--name-only").stdout.split()
+    if staged:
+        err("00058", f"--stamp-version: something is staged, the amend would fold it in: {' '.join(staged)}")
+    if git("diff", "--quiet", "--", rel).returncode != 0:
+        err("00059", "--stamp-version: this file has uncommitted edits -- commit them first")
+    sha = git("rev-parse", "--short", "HEAD").stdout.strip()
+    desc = git("describe", "--tags", "--long").stdout.strip()
+    with open(me) as fh:
+        src = fh.read()
+    new, n1 = re.subn(r'^SCRIPT_COMMIT = .*$', f'SCRIPT_COMMIT = "{sha}"', src, count=1, flags=re.M)
+    new, n2 = re.subn(r'^SCRIPT_RELEASE = .*$', f'SCRIPT_RELEASE = "{desc}"', new, count=1, flags=re.M)
+    if (n1, n2) != (1, 1):
+        err("00060", "--stamp-version: the stamp lines are not there")
+    fd, tmp = tempfile.mkstemp(dir=here, prefix=f".{NAME}.stamp.")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(new)
+    shutil.copymode(me, tmp)
+    os.replace(tmp, me)
+    if git("add", "--", rel).returncode != 0 or git("commit", "--amend", "--no-edit").returncode != 0:
+        err("00061", "--stamp-version: git add / commit --amend failed")
+    out(f"stamped SCRIPT_COMMIT={sha} SCRIPT_RELEASE={desc or '<no tag yet>'} -- "
+        f"HEAD is now {git('rev-parse', '--short', 'HEAD').stdout.strip()}")
+    return 0
+
+
+VERBS: Final = ("status", "enable", "disable", "web", "check", "diag")
+FLAGS: Final = ("--install", "--uninstall", "--create-config", "--config", "--test-mail", "--version",
+                "--run-tests", "--stamp-version", "--help")
+
+COMPLETION: Final = f"""#compdef {NAME}
+_{NAME.replace('-', '_')}() {{
+  local -a verbs
+  verbs=(
+    'status:the status alone'
+    'disable:stop syncing a folder on this host (none: all)'
+    'enable:sync it again'
+    'web:open the Syncthing web UI'
+    'check:the conditions, told through the alerts'
+    'diag:the building blocks'
+  )
+  _arguments -s \\
+    '-S[print what would change, change nothing]' '-Q[quiet: only conditions and errors]' \\
+    '-V[more detail]' '-D[diagnostics]' '--config[use this config]:file:_files' \\
+    '--install[this host as the config says]' '--uninstall[the service and the check agent]' \\
+    '--create-config[the default config]::file:_files' '--test-mail[one test through ALERT_LATER]' \\
+    '--version' '--run-tests[the built-in tests]' '--help' \\
+    '1:verb:->verb' '*::arg:->arg'
+  case $state in
+    verb) _describe verb verbs ;;
+    arg) case $words[1] in
+           enable|disable) compadd -- ${{(f)"$({NAME} diag complete 2>/dev/null)"}} ;;
+           diag) compadd -- {' '.join(DIAG)} ;;
+         esac ;;
+  esac
+}}
+_{NAME.replace('-', '_')} "$@"
+"""
+
+
+def install_completion() -> None:
+    """Best effort, every run: ~/.zsh/completions/_my-syncthing, and the fpath line once."""
+    if os.getuid() == 0 or OUT.simulate:
+        return
+    try:
+        d = os.path.expanduser("~/.zsh/completions")
+        path = os.path.join(d, f"_{NAME}")
+        try:
+            with open(path) as fh:
+                if fh.read() == COMPLETION:
+                    return
+        except FileNotFoundError:
+            pass
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp.")
+        with os.fdopen(fd, "w") as fh:
+            fh.write(COMPLETION)
+        os.chmod(tmp, 0o644)                 # 600 would make compinit skip it silently
+        os.replace(tmp, path)
+        home = os.path.expanduser("~")
+        for n in os.listdir(home):
+            if n.startswith(".zcompdump"):
+                os.remove(os.path.join(home, n))
+        rc = os.path.join(home, ".zshrc")
+        line = "fpath=(~/.zsh/completions $fpath)"
+        text = ""
+        if os.path.exists(rc):
+            with open(rc) as fh:
+                text = fh.read()
+        if line in text:
+            return
+        lines = text.splitlines(keepends=True)
+        at = next((i for i, x in enumerate(lines) if "oh-my-zsh.sh" in x and x.lstrip().startswith(("source", "."))),
+                  None)
+        if at is None:
+            lines.append(f"\n{line}\nautoload -Uz compinit && compinit\n")
+        else:
+            lines.insert(at, line + "\n")
+        with open(rc + ".tmp", "w") as fh:
+            fh.write("".join(lines))
+        os.replace(rc + ".tmp", rc)
+    except OSError as e:
+        dbg(f"zsh completion not installed: {e}")
+
+
+SHORT_USAGE: Final = f"""\
+usage: {NAME} [-S] [-Q] [-V] [-D] [--config <FILE>] [<VERB> [<FOLDER>...]]
+  status               the status alone
+  disable [<FOLDER>]   stop syncing a folder on this host (none: all)
+  enable [<FOLDER>]    sync it again
+  web                  open this host's Syncthing web UI
+  check                the conditions, told through the alerts
+  diag [<BLOCK>]       the building blocks
+  --install, --help, ... -- `{NAME} --help`
+"""
+
+USAGE: Final = f"""\
+usage: {NAME} [-S] [-Q] [-V] [-D] [--config <FILE>] [<VERB> [<ARG>...]]
+
+Set up and watch a Syncthing cluster from ONE config: which host is the hub,
+where it listens, which devices exist, which folders go where. It syncs
+nothing itself -- Syncthing does; this makes each host match the config and
+reports what Syncthing really does.
+
+VERBS
+  (none)               this usage, then the status
+  status               the status: one line per fact, the raw value beside it;
+                       a condition that holds goes to stderr (!!!), and one
+                       summary line ends it
+  disable [<FOLDER>]   stop syncing FOLDER on THIS host (none: every folder) --
+                       Syncthing's own paused flag: it lasts, touches no data,
+                       and the other hosts go on among themselves
+  enable [<FOLDER>]    sync it again
+  web                  open this host's Syncthing web UI in the default browser
+  check                the conditions; each is run through ALERT_NOW at once
+                       and, still there ALERT_DELAY later, through ALERT_LATER
+                       once -- what the check agent runs
+  diag [<BLOCK>]       a building block: {', '.join(DIAG)}
+
+MODIFIERS
+  -S                   print what would change and change nothing
+  -Q                   quiet: only conditions and errors (stderr)
+  -V                   more detail (conflict file names, the plan's notes)
+  -D                   diagnostics: -V, and each REST call
+  --config <FILE>      use this config
+
+ADMIN
+  --install            this host as the config says: Syncthing (Homebrew on
+                       macOS), its identity, its service (SERVICE), settings,
+                       devices, folders, ignores, the check agent. A host the
+                       config does not know prints its DEVICE_ line and stops.
+                       A folder that already holds data starts receive-only and
+                       becomes send-and-receive when nothing differs. As root:
+                       only the boot-time service of SERVICE=daemon.
+  --uninstall          the service and the check agent; data and identity stay
+  --create-config [<FILE>]  print the default config, or write it (never over
+                       an existing file)
+  --test-mail          one test through ALERT_LATER, the path the alerts take
+  --version            version, commit and build id
+  --run-tests [<FILTER>]    the built-in tests (a stub Syncthing; nothing real)
+  --stamp-version      record the commit in this file (maintainer)
+  -h, --help           this text
+
+EXIT
+  0 healthy, 1 a condition holds (or --install needs the config changed),
+  2 an ERROR, 70 an internal error (the trace goes to a file), 130 Ctrl-C
+
+CONFIG, first found wins
+  ${CONFIG_ENV}, --config <FILE>, then {', '.join(config_search_paths())}
+"""
+
+
+# ---------------------------------------------------------------------------
+# main
+
+def internal_error(log_root: str) -> int:
+    """An exception nothing expected: one line on stderr, the trace in a file."""
+    import traceback
+    e = sys.exc_info()[1]
+    d = log_root if os.path.isdir(log_root) else tempfile.gettempdir()
+    path = os.path.join(d, f"{NAME}.trace")
+    try:
+        with open(path, "w") as fh:
+            fh.write(f"{version_string()} while {PHASE[0]}\n")
+            traceback.print_exc(file=fh)
+        where = f"the trace is in {path}"
+    except OSError:
+        where = "the trace could not be written"
+    sys.stderr.write(f"ERROR 00062 [70]: internal error while {PHASE[0]}: {type(e).__name__}: {e} -- {where}\n")
+    return 70
+
+
+def main(argv: Sequence[str], log_root: str = "") -> int:
+    logs = log_root or default_state_dir()
+    try:
+        return _main(list(argv))
+    except Err as e:
+        sys.stderr.write(f"ERROR {e.code} [{e.exit_code}]: {e.msg}\n")
+        return e.exit_code
+    except KeyboardInterrupt:
+        sys.stderr.write(f"{NAME}: interrupted (Ctrl-C) while {PHASE[0]} -- what was done before stays, "
+                         f"nothing is half-written; run it again to go on\n")
+        return 130
+    except Exception:
+        return internal_error(logs)
+
+
+def _main(args: list[str]) -> int:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    OUT.quiet = OUT.vrb = OUT.dbg = OUT.simulate = False
+    PHASE[0] = "reading the arguments"
+    config = ""
+    rest: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "-S":
+            OUT.simulate = True
+        elif a == "-Q":
+            OUT.quiet = True
+        elif a == "-V":
+            OUT.vrb = True
+        elif a == "-D":
+            OUT.dbg = OUT.vrb = True
+        elif a == "--config" or a.startswith("--config="):
+            if a == "--config":
+                i += 1
+                if i >= len(args):
+                    err("00063", "--config needs a <FILE>")
+                config = args[i]
+            else:
+                config = a.split("=", 1)[1]
+        else:
+            rest.append(a)
+        i += 1
+    if OUT.vrb:
+        OUT.quiet = False                              # -V beats -Q
+    verb, vargs = (rest[0], rest[1:]) if rest else ("", [])
+    if verb in ("-h", "--help"):
+        sys.stdout.write(USAGE)
+        return 0
+    if verb == "--version":
+        sys.stdout.write(version_string() + "\n")
+        return 0
+    if verb == "--run-tests":
+        return run_tests(vargs[0] if vargs else "")
+    if verb == "--stamp-version":
+        return stamp_version()
+    if verb == "--create-config" or verb.startswith("--create-config="):
+        return create_config(verb.split("=", 1)[1] if "=" in verb else (vargs[0] if vargs else ""))
+    if verb.startswith("--") and verb[2:] in VERBS:
+        err("00064", f"no such option '{verb}' -- you mean `{NAME} {verb[2:]}`")
+    if verb.startswith("-") and verb not in FLAGS:
+        err("00065", f"unknown option '{verb}' -- `{NAME} --help`")
+    if verb and not verb.startswith("-") and verb not in VERBS:
+        err("00066", f"no verb '{verb}' -- {', '.join(VERBS)} (`{NAME} --help`)")
+    if verb not in ("enable", "disable", "diag") and vargs:
+        err("00067", f"'{verb or NAME}' takes no argument: {' '.join(vargs)}")
+    PHASE[0] = "reading the config"
+    cfg = read_config(find_config(config))
+    install_completion()
+    if verb == "":
+        sys.stdout.write("" if OUT.quiet else SHORT_USAGE + "\n")
+        PHASE[0] = "reading the status"
+        return cmd_status(cfg)
+    PHASE[0] = f"running {verb}"
+    table: dict[str, Callable[[], int]] = {
+        "status": lambda: cmd_status(cfg),
+        "enable": lambda: cmd_pause(cfg, vargs, False),
+        "disable": lambda: cmd_pause(cfg, vargs, True),
+        "web": lambda: cmd_web(cfg),
+        "check": lambda: cmd_check(cfg),
+        "diag": lambda: cmd_diag(cfg, vargs),
+        "--install": lambda: cmd_install(cfg),
+        "--uninstall": lambda: cmd_uninstall(cfg),
+        "--test-mail": lambda: cmd_test_mail(cfg),
+    }
+    return table[verb]()
+
+
+# ---------------------------------------------------------------------------
+# --run-tests: a stub Syncthing (REST over http on loopback), nothing real
+
+ID_ME: Final = "-".join(["MEMEMEM"] * 8)
+ID_HUB: Final = "-".join(["HUBHUBH"] * 8)
+ID_OTHER: Final = "-".join(["OTHERST"] * 8)
+
+
+class Stub:
+    """Syncthing's REST API, as far as my-syncthing uses it; every write recorded."""
+
+    def __init__(self, my_id: str) -> None:
+        self.key = "test-api-key"
+        self.my_id = my_id
+        self.options: JObj = {
+            "listenAddresses": ["default"], "startBrowser": True, "globalAnnounceEnabled": True,
+            "localAnnounceEnabled": True, "relaysEnabled": True, "natEnabled": True, "urAccepted": 0,
+            "autoUpgradeIntervalH": 12, "crashReportingEnabled": True}
+        self.devices: list[JObj] = [{"deviceID": my_id, "name": "", "addresses": ["dynamic"],
+                                     "autoAcceptFolders": False}]
+        self.folders: list[JObj] = []
+        self.ignores: dict[str, list[object]] = {}
+        self.state: dict[str, str] = {}
+        self.need: dict[str, int] = {}
+        self.local: dict[str, int] = {}
+        self.conns: dict[str, JObj] = {}
+        self.writes: list[tuple[str, str, object]] = []
+        self.port = 0
+        self.stop: Callable[[], None] = lambda: None
+
+    def start(self) -> None:
+        import http.server
+        import threading
+        stub = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002 -- the base's name
+                pass
+
+            def answer(self) -> None:
+                if self.headers.get("X-API-Key") != stub.key:
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                n = int(self.headers.get("Content-Length") or 0)
+                body: object = json.loads(self.rfile.read(n)) if n else None
+                code, obj = stub.handle(self.command, self.path, body)
+                data = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self) -> None:
+                self.answer()
+
+            def do_PUT(self) -> None:
+                self.answer()
+
+            def do_PATCH(self) -> None:
+                self.answer()
+
+            def do_POST(self) -> None:
+                self.answer()
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        def stop() -> None:
+            srv.shutdown()
+            srv.server_close()
+        self.stop = stop
+
+    def folder(self, fid: str) -> JObj:
+        return next(f for f in self.folders if f.get("id") == fid)
+
+    def handle(self, method: str, raw: str, body: object) -> tuple[int, object]:
+        import urllib.parse
+        u = urllib.parse.urlsplit(raw)
+        q = dict(urllib.parse.parse_qsl(u.query))
+        p = u.path
+        fid = q.get("folder", "")
+        if method != "GET":
+            self.writes.append((method, raw, body))
+        if (method, p) == ("GET", "/rest/system/ping"):
+            return 200, {"ping": "pong"}
+        if (method, p) == ("GET", "/rest/system/status"):
+            return 200, {"myID": self.my_id, "uptime": 3700}
+        if (method, p) == ("GET", "/rest/system/version"):
+            return 200, {"version": "v2.1.5"}
+        if (method, p) == ("GET", "/rest/system/connections"):
+            return 200, {"connections": self.conns, "total": {}}
+        if p == "/rest/config/options":
+            if method == "PATCH":
+                self.options.update(jobj(body, "test body"))
+            return 200, self.options
+        if p == "/rest/config/devices":
+            return 200, self.devices
+        if p.startswith("/rest/config/devices/"):
+            dev = p.rsplit("/", 1)[1]
+            have = [d for d in self.devices if d.get("deviceID") == dev]
+            if method == "PUT":
+                self.devices = [d for d in self.devices if d.get("deviceID") != dev] + [jobj(body, "test body")]
+            elif method == "PATCH" and have:
+                have[0].update(jobj(body, "test body"))
+            return 200, {}
+        if p == "/rest/config/folders":
+            return 200, self.folders
+        if p.startswith("/rest/config/folders/"):
+            fid = p.rsplit("/", 1)[1]
+            if method == "PUT":
+                self.folders = [f for f in self.folders if f.get("id") != fid] + [jobj(body, "test body")]
+            elif method == "PATCH":
+                self.folder(fid).update(jobj(body, "test body"))
+            return 200, {}
+        if p == "/rest/db/ignores":
+            if method == "POST":
+                self.ignores[fid] = jlist(jobj(body, "test body").get("ignore"))
+            return 200, {"ignore": self.ignores.get(fid)}
+        if p == "/rest/db/status":
+            return 200, {"state": self.state.get(fid, "idle"), "needBytes": self.need.get(fid, 0),
+                         "globalBytes": 4096}
+        if p == "/rest/db/completion":
+            return 200, {"completion": 100, "remoteState": "valid"}
+        if p == "/rest/folder/errors":
+            return 200, {"folder": fid, "errors": []}
+        if p == "/rest/db/localchanged":
+            return 200, {"files": [{"name": f"x{i}"} for i in range(self.local.get(fid, 0))], "page": 1}
+        return 404, {"error": f"the stub has no {method} {p}"}
+
+
+# Loads this file as a module and calls main() with the check's log root: the
+# seam the tests use. "boom" plants an exception nothing expects.
+LOADER: Final = """\
+import sys, importlib.util, importlib.machinery
+ld = importlib.machinery.SourceFileLoader("my_syncthing", sys.argv[1])
+spec = importlib.util.spec_from_loader("my_syncthing", ld)
+assert spec is not None
+m = importlib.util.module_from_spec(spec)
+ld.exec_module(m)
+if sys.argv[3] == "boom":
+    def boom(cfg):
+        raise ZeroDivisionError("planted by the test")
+    m.cmd_status = boom
+sys.exit(m.main(sys.argv[4:], log_root=sys.argv[2]))
+"""
+
+
+class T:
+    """What a test gets: its own directory, a stub Syncthing, the verdict helpers."""
+
+    def __init__(self) -> None:
+        self.root = ""
+        self.passed = 0
+        self.failed = 0
+        self.host = this_host()
+        self.stub = Stub(ID_ME)
+
+    def ok(self, what: str) -> None:
+        sys.stdout.write(f"  ok   {what}\n")
+        self.passed += 1
+
+    def bad(self, what: str) -> None:
+        sys.stdout.write(f"  FAIL {what}\n")
+        self.failed += 1
+
+    def is_(self, what: str, got: object, want: object) -> None:
+        if got == want:
+            self.ok(what)
+        else:
+            self.bad(f"{what} (want {want!r}, got {got!r})")
+
+    def has(self, what: str, text: str, part: str) -> None:
+        if part in text:
+            self.ok(what)
+        else:
+            self.bad(f"{what} (no {part!r} in {text!r})")
+
+    def p(self, *rel: str) -> str:
+        return os.path.join(self.root, *rel)
+
+    def setup(self, root: str) -> None:
+        self.root = root
+        for d in ("home", "st", "state", "log", "bin", "data"):
+            os.makedirs(self.p(d))
+        self.stub = Stub(ID_ME)
+        self.stub.start()
+        self.gui(self.stub.port)
+        with open(self.p("bin", "alert"), "w") as fh:
+            fh.write(f"#!/bin/dash\nprintf '%s|%s|%s\\n' \"$1\" \"$2\" \"$(printf %s \"$3\" | tr '\\n' ' ')\" "
+                     f">> {shlex.quote(self.p('alerts'))}\n")
+        os.chmod(self.p("bin", "alert"), 0o755)
+        self.conf()
+
+    def gui(self, port: int) -> None:
+        with open(self.p("st", "config.xml"), "w") as fh:
+            fh.write(f'<configuration><gui tls="false"><address>127.0.0.1:{port}</address>'
+                     f'<apikey>{self.stub.key}</apikey></gui></configuration>\n')
+
+    def conf(self, **over: str) -> None:
+        """The test config: a peer of hub 'hubx' with one folder; KEY='' drops a key."""
+        c = {"HUB": "hubx", "HUB_ADDRESSES": "tcp://192.0.2.1:22000", "SERVICE": "none", "CHECK_AGENT": "no",
+             "SYNCTHING_HOME": self.p("st"), "STATE_DIR": self.p("state"), "HUB_GRACE": "0s", "SYNC_GRACE": "0s",
+             "ALERT_NOW": f"{self.p('bin', 'alert')} now", "ALERT_LATER": f"{self.p('bin', 'alert')} later",
+             f"DEVICE_{self.host}": ID_ME, "DEVICE_hubx": ID_HUB,
+             "FOLDER_data": f"{self.p('data')} hosts=hubx,{self.host} versioning=staggered:365d "
+                            f"ignore=(?d).DS_Store,.git,/2/learn"}
+        c.update(over)
+        with open(self.p("conf"), "w") as fh:
+            fh.write("".join(f"{k}={shlex.quote(v)}\n" for k, v in c.items() if v != "" or k == "ALERT_LATER"))
+
+    def proc(self, args: Sequence[str], boom: bool = False) -> subprocess.Popen[bytes]:
+        env = {"PATH": self.p("bin") + os.pathsep + os.environ.get("PATH", ""), "HOME": self.p("home"),
+               "USER": this_user(), "LINKS": self.p("links"), CONFIG_ENV: self.p("conf")}
+        return subprocess.Popen(
+            [sys.executable, "-I", "-S", "-B", "-c", LOADER, os.path.realpath(__file__), self.p("log"),
+             "boom" if boom else "-", *args],
+            cwd=self.root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+
+    def run(self, *args: str, boom: bool = False) -> tuple[int, str, str]:
+        p = self.proc(args, boom)
+        o, e = p.communicate()
+        return p.returncode, o.decode(errors="replace"), e.decode(errors="replace")
+
+    def alerts(self) -> list[str]:
+        try:
+            with open(self.p("alerts")) as fh:
+                return fh.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def hub_up(self, up: bool = True) -> None:
+        self.stub.conns = {ID_HUB: {"connected": True, "address": "192.0.2.1:22000",
+                                    "startedAt": "2026-10-26T08:29:19+01:00", "type": "tcp-client"}} if up else {}
+
+
+def t_config(t: T) -> None:
+    rc, o, _ = t.run("--create-config")
+    t.is_("--create-config: the defaults on stdout", (rc, o.startswith(f"## {NAME}"), "HUB=" in o), (0, True, True))
+    target = t.p("new.conf")
+    t.is_("--create-config <FILE>: written", (t.run("--create-config", target)[0], os.path.isfile(target)), (0, True))
+    rc, _, e = t.run("--create-config", target)
+    t.is_("...never over an existing file", (rc, "exists -- not overwritten" in e), (2, True))
+    t.conf(FOLDER_data=f"{t.p('data')} label=x")
+    t.has("a folder without hosts=: an ERROR naming the key", t.run("status")[2], "FOLDER_data: hosts= is required")
+    t.conf(FOLDER_data=f"{t.p('data')} hosts={t.host}")
+    t.has("a folder without the hub: refused", t.run("status")[2], "lacks the hub 'hubx'")
+    t.conf(DEVICE_hubx="NOT-AN-ID")
+    t.has("a bad device ID: refused", t.run("status")[2], "not a device ID")
+    t.conf(SERVICE="sometimes")
+    t.has("a bad SERVICE: refused", t.run("status")[2], "agent, daemon, none")
+    os.remove(t.p("conf"))
+    rc, _, e = t.run("status")
+    t.is_("a named config that is not there: rc 2", (rc, "is not there ($MY_SYNCTHING_CONFIG)" in e), (2, True))
+
+
+def t_config_offer(t: T) -> None:
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": t.p("home"), "USER": this_user(), "LINKS": t.p("links")}
+    p = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", LOADER, os.path.realpath(__file__), t.p("log"),
+                        "-", "status"], env=env, capture_output=True, text=True)
+    search = [f"{t.p('links')}/default/{NAME}.conf", f"{t.p('links')}/default/{NAME}",
+              f"{t.p('home')}/.{NAME}.conf", f"/etc/{NAME}.conf", f"/usr/local/etc/{NAME}.conf"]
+    offered = re.findall(r"--create-config > (\S+)", p.stderr)
+    if os.path.exists(f"/etc/{NAME}.conf") or os.path.exists(f"/usr/local/etc/{NAME}.conf"):
+        t.ok("(a real config exists on this machine: the offer is not reachable here)")
+        return
+    t.is_("no config: rc 2 and an offer", (p.returncode, len(offered) > 0), (2, True))
+    t.is_("...every offered path is one the search reads", [x for x in offered if x not in search], [])
+
+
+def t_install(t: T) -> None:
+    with open(t.p("data", "doc.txt"), "w") as fh:
+        fh.write("already here\n")
+    t.stub.local["data"] = 2
+    rc, o, _ = t.run("--install")
+    w = t.stub.writes
+    t.is_("--install: rc 0", rc, 0)
+    opts = t.stub.options
+    t.is_("options: a peer listens on loopback, nothing calls home",
+          (opts["listenAddresses"], opts["relaysEnabled"], opts["globalAnnounceEnabled"], opts["urAccepted"],
+           opts["autoUpgradeIntervalH"], opts["crashReportingEnabled"], opts["startBrowser"]),
+          (["tcp://127.0.0.1:22000"], False, False, -1, 0, False, False))
+    hub = next(d for d in t.stub.devices if d.get("deviceID") == ID_HUB)
+    t.is_("the hub: added, dialled at its fixed address", (hub.get("name"), hub.get("addresses")),
+          ("hubx", ["tcp://192.0.2.1:22000"]))
+    f = t.stub.folder("data")
+    t.is_("the folder holding data: receiveonly, xattrs and ownership off, perms ignored",
+          (f.get("type"), f.get("syncXattrs"), f.get("sendXattrs"), f.get("syncOwnership"), f.get("ignorePerms")),
+          ("receiveonly", False, False, False, True))
+    t.is_("...versioning staggered, 1 year in seconds", f.get("versioning"),
+          {"type": "staggered", "params": {"maxAge": "31536000"}})
+    order = [(m, path.split("?")[0]) for m, path, _ in w if "folders/data" in path or "ignores" in path]
+    t.is_("...added paused, its ignores set, then started",
+          order, [("PUT", "/rest/config/folders/data"), ("POST", "/rest/db/ignores"),
+                  ("PATCH", "/rest/config/folders/data")])
+    t.is_("...the ignores", t.stub.ignores.get("data"), ["(?d).DS_Store", ".git", "/2/learn"])
+    t.has("...and why it is receive-only", o, "already holds data")
+    n = len(w)
+    rc, o, _ = t.run("--install")
+    t.is_("a second --install changes nothing", (rc, len(t.stub.writes) - n), (0, 0))
+    t.has("...and says so", o, "nothing to change")
+    t.has("...naming why the folder stays receive-only", o, "stays receiveonly -- 2 local change(s)")
+
+
+def t_receiveonly(t: T) -> None:
+    with open(t.p("data", "doc.txt"), "w") as fh:
+        fh.write("already here\n")
+    t.stub.local["data"] = 1
+    t.run("--install")
+    t.stub.state["data"] = "scanning"
+    t.stub.local["data"] = 0
+    t.run("--install")
+    t.is_("still scanning: stays receiveonly", t.stub.folder("data").get("type"), "receiveonly")
+    t.stub.state["data"] = "idle"
+    rc, o, _ = t.run("--install")
+    t.is_("scanned, nothing differs: sendreceive", (rc, t.stub.folder("data").get("type")), (0, "sendreceive"))
+    t.has("...saying why", o, "receiveonly -> sendreceive (scanned, nothing differs here)")
+    n = len(t.stub.writes)
+    t.run("--install")
+    t.is_("...and the next run changes nothing", len(t.stub.writes) - n, 0)
+
+
+def t_unknown_host(t: T) -> None:
+    t.conf(**{f"DEVICE_{t.host}": "", "FOLDER_data": f"{t.p('data')} hosts=hubx"})
+    rc, o, _ = t.run("--install")
+    t.is_("a host the config does not know: rc 1, nothing written", (rc, len(t.stub.writes)), (1, 0))
+    t.has("...it prints its DEVICE_ line", o, f"DEVICE_{t.host}={ID_ME}")
+    t.has("...and the folders it is in no hosts= of", o, "should sync: data")
+    t.conf(**{f"DEVICE_{t.host}": ID_OTHER})
+    rc, _, e = t.run("--install")
+    t.is_("a config naming another ID: refused, nothing written", (rc, "a new identity?" in e, len(t.stub.writes)),
+          (2, True, 0))
+
+
+def t_status(t: T) -> None:
+    t.run("--install")
+    t.hub_up()
+    rc, o, e = t.run("status")
+    t.is_("in sync, hub connected: rc 0, nothing on stderr", (rc, e), (0, ""))
+    t.has("...the host line, with the raw id", o, f" >>> {t.host} (peer, hub hubx): Syncthing v2.1.5, up 1h 1m "
+          f"[id MEMEMEM]")
+    t.has("...the hub with its address", o, "    > hub hubx: connected via 192.0.2.1:22000 since 2026-10-26 08:29")
+    t.has("...the folder", o, f" >>> folder data ({t.p('data')}): idle, in sync [sendreceive; 4.1 kB; "
+          f"0 error(s); 0 conflict(s)]")
+    t.has("...the settings", o, " >>> settings: as configured [0 changes]")
+    t.has("...the summary", o, " >>> healthy [0 conditions]")
+    t.is_("`status` prints no usage", "usage:" in o, False)
+    rc, o, _ = t.run()
+    t.is_("bare: the usage first, then the status", (rc, o.startswith(f"usage: {NAME}"), "healthy" in o),
+          (0, True, True))
+    plain = t.run("status")[1].splitlines()
+    rc, o, _ = t.run("-V", "status")
+    t.is_("-V: every default line, and more", ([x for x in plain if x not in o.splitlines()],
+                                               len(o.splitlines()) > len(plain)), ([""][:0], True))
+    t.has("...the config and the API it used", o, f"    > config {t.p('conf')}; Syncthing's ")
+    t.hub_up(False)
+    rc, o, e = t.run("status")
+    t.is_("hub not connected: rc 1, the condition on stderr",
+          (rc, e.startswith("!!! hub-unreachable: hub hubx not connected [tcp://192.0.2.1:22000]")), (1, True))
+    t.has("...and the summary names it", o, " >>> 1 condition(s): hub-unreachable")
+    rc, o, e = t.run("-Q", "status")
+    t.is_("-Q: nothing on stdout, the condition still on stderr", (rc, o, "!!! hub-unreachable" in e), (1, "", True))
+
+
+def t_conflicts(t: T) -> None:
+    t.run("--install")
+    t.hub_up()
+    os.makedirs(t.p("data", "sub"))
+    os.makedirs(t.p("data", ".stversions"))
+    for x in ("sub/a.sync-conflict-20261026-101010-MEMEMEM.txt", ".stversions/b.sync-conflict-1-2-X.txt"):
+        open(t.p("data", x), "w").close()
+    rc, o, e = t.run("status")
+    t.is_("a conflict file: rc 1, counted -- not the one in .stversions",
+          (rc, "1 conflict(s)" in o, "!!! conflicts: data: 1 *.sync-conflict-* file(s)" in e), (1, True, True))
+    t.has("-V names it", t.run("-V", "status")[1], "sub/a.sync-conflict-20261026-101010-MEMEMEM.txt")
+
+
+def t_disable(t: T) -> None:
+    t.conf(FOLDER_more=f"{t.p('home', 'more')} hosts=hubx,{t.host}")
+    t.run("--install")
+    t.hub_up()
+    rc, o, _ = t.run("disable")
+    t.is_("disable, no folder: every folder paused", (rc, [f.get("paused") for f in t.stub.folders]), (0, [True, True]))
+    t.has("...saying the others go on", o, "the other hosts go on")
+    rc, _, _ = t.run("enable", "data")
+    t.is_("enable data: only data", sorted((jstr(f, "id"), f.get("paused")) for f in t.stub.folders),
+          [("data", False), ("more", True)])
+    rc, o, e = t.run("status")
+    t.has("status shows the disabled folder", o, f" >>> folder more ({t.p('home', 'more')}): DISABLED here since ")
+    n = len(t.stub.writes)
+    t.run("--install")
+    t.is_("--install leaves it disabled", (len(t.stub.writes) - n, t.stub.folder("more").get("paused")), (0, True))
+    rc, _, e = t.run("disable", "nope")
+    t.is_("an unknown folder: rc 2, the known ones named", (rc, "it has: data, more" in e), (2, True))
+
+
+def t_drift(t: T) -> None:
+    t.run("--install")
+    t.hub_up()
+    t.stub.folder("data")["syncXattrs"] = True
+    rc, _, e = t.run("check")
+    t.is_("xattrs switched on: drift, rc 1", (rc, "!!! drift: 1 setting(s) not as configured: folder data: "
+                                              "syncXattrs -> false" in e), (1, True))
+    t.is_("...told at once through ALERT_NOW", [a.split("|")[0] for a in t.alerts()], ["now"])
+    t.stub.options["relaysEnabled"] = True
+    t.has("a relay switched back on: drift too", t.run("status")[1], "relaysEnabled true -> false")
+
+
+def t_alerts(t: T) -> None:
+    t.run("--install")
+    t.hub_up(False)
+    t.conf(HUB_GRACE="15m")
+    rc, _, e = t.run("check")
+    t.is_("within HUB_GRACE: not a condition yet, no alert", (rc, e, len(t.alerts())), (0, "", 0))
+    t.conf()
+    rc, _, _ = t.run("check")
+    t.is_("held: rc 1, ALERT_NOW once", (rc, t.alerts()),
+          (1, [f"now|{NAME} {t.host}: hub-unreachable|hub hubx not connected [tcp://192.0.2.1:22000]"]))
+    t.run("check")
+    t.is_("...not again on the next check", len(t.alerts()), 1)
+    path = t.p("state", "state.json")
+    with open(path) as fh:
+        st = json.load(fh)
+    st["conditions"]["hub-unreachable"]["first"] -= 31 * 60
+    with open(path, "w") as fh:
+        json.dump(st, fh)
+    t.run("check")
+    t.is_("ALERT_DELAY later: ALERT_LATER once", [a.split("|")[0] for a in t.alerts()], ["now", "later"])
+    t.run("check")
+    t.is_("...and not again", len(t.alerts()), 2)
+    t.hub_up()
+    rc, _, _ = t.run("check")
+    t.is_("gone: rc 0, one 'cleared' through ALERT_NOW",
+          (rc, t.alerts()[-1]), (0, f"now|{NAME} {t.host}: hub-unreachable cleared|"))
+    t.run("check")
+    t.is_("...once", len(t.alerts()), 3)
+
+
+def t_test_mail(t: T) -> None:
+    rc, o, _ = t.run("--test-mail")
+    t.is_("--test-mail: through ALERT_LATER, rc 0", (rc, t.alerts()[0].split("|")[:2]),
+          (0, ["later", f"{NAME} {t.host}: TEST mail"]))
+    t.has("...the raw rc beside it", o, "[rc 0]")
+    t.conf(ALERT_LATER="")
+    rc, _, e = t.run("--test-mail")
+    t.is_("ALERT_LATER empty: refused, rc 2", (rc, "ALERT_LATER is empty" in e), (2, True))
+
+
+def t_simulate(t: T) -> None:
+    rc, o, _ = t.run("-S", "--install")
+    t.is_("-S --install: rc 0, nothing written", (rc, len(t.stub.writes)), (0, 0))
+    t.has("...the writes shown", o, "(-S) would PUT /rest/config/folders/data")
+    t.has("...and the summary does not claim them made", o, "change(s) would be made (-S)")
+    t.run("--install")
+    t.hub_up()
+    rc, o, _ = t.run("-S", "disable", "data")
+    t.is_("-S disable: nothing written", (rc, t.stub.folder("data").get("paused")), (0, False))
+
+
+def t_not_running(t: T) -> None:
+    t.stub.stop()
+    rc, o, e = t.run("status")
+    t.is_("Syncthing not answering: rc 1, the condition", (rc, e.startswith("!!! not-running: Syncthing does not "
+                                                                            "answer at http://127.0.0.1:")), (1, True))
+    t.has("...the status says it", o, "Syncthing NOT running")
+    rc, _, e = t.run("--install")
+    t.is_("--install with SERVICE=none: an ERROR", (rc, "does not answer" in e), (2, True))
+    os.remove(t.p("st", "config.xml"))
+    t.has("no Syncthing config: the condition names --install", t.run("status")[2], f"`{NAME} --install`")
+
+
+def t_interrupt(t: T) -> None:
+    t.run("--install")
+    pid = t.p("alert.pid")
+    with open(t.p("bin", "slow"), "w") as fh:
+        fh.write(f"#!/bin/dash\necho $$ > {shlex.quote(pid)}\nexec sleep 30\n")
+    os.chmod(t.p("bin", "slow"), 0o755)
+    t.conf(ALERT_NOW=t.p("bin", "slow"))
+    p = t.proc(["check"])
+    for _ in range(200):
+        if os.path.exists(pid):
+            break
+        time.sleep(0.05)
+    time.sleep(0.2)
+    p.send_signal(signal.SIGINT)
+    _, e = p.communicate()
+    text = e.decode()
+    t.is_("Ctrl-C: rc 130, one line, no traceback",
+          (p.returncode, len([x for x in text.splitlines() if not x.startswith("!!!")]), "Traceback" in text),
+          (130, 1, False))
+    t.has("...saying where it stopped", text, "while telling the conditions")
+
+
+def t_unexpected(t: T) -> None:
+    rc, _, e = t.run("status", boom=True)
+    t.is_("an unexpected error: rc 70, one line", (rc, len(e.splitlines()), "internal error" in e), (70, 1, True))
+    t.is_("...the trace in the log directory", os.path.isfile(t.p("log", f"{NAME}.trace")), True)
+
+
+def t_face(t: T) -> None:
+    rc, o, _ = t.run("--help")
+    t.is_("--help: the usage line first", (rc, o.startswith(f"usage: {NAME} [")), (0, True))
+    t.has("--status: answered, not 'unknown option'", t.run("--status")[2], f"you mean `{NAME} status`")
+    t.has("an unknown verb: the verbs named", t.run("stats")[2], "status, enable, disable")
+    t.has("--version: the build id", t.run("--version")[1], "build ")
+    t.conf(SYNC_USER="somebody-else")
+    rc, _, e = t.run("--install")
+    t.is_("--install as another user than SYNC_USER: refused", (rc, "run --install as somebody-else" in e), (2, True))
+
+
+TESTS: Final[tuple[tuple[str, Callable[[T], None]], ...]] = (
+    ("config: --create-config, bad lines, a missing file", t_config),
+    ("config: none found -- the offer names only searched paths", t_config_offer),
+    ("--install: settings, devices, folder, ignores; the second run changes nothing", t_install),
+    ("--install: receive-only until scanned and nothing differs", t_receiveonly),
+    ("--install: an unknown host introduces itself", t_unknown_host),
+    ("status: facts, raw values, the usage, -V, -Q", t_status),
+    ("conflict files: counted, .stversions left out", t_conflicts),
+    ("disable / enable: one folder, all; --install leaves them", t_disable),
+    ("check: drift", t_drift),
+    ("check: grace, alert now, later once, cleared", t_alerts),
+    ("--test-mail", t_test_mail),
+    ("-S changes nothing", t_simulate),
+    ("Syncthing not running", t_not_running),
+    ("Ctrl-C: rc 130, one line", t_interrupt),
+    ("an unexpected error: rc 70, the trace in a file", t_unexpected),
+    ("--help, a dashed verb, --version, SYNC_USER", t_face),
+)
+
+
+def run_tests(filt: str) -> int:
+    """TAP: the plan first, then `ok K - title` / `not ok K - title`."""
+    sel = [(title, fn) for title, fn in TESTS if filt in title]
+    if not sel:
+        err("00068", f"--run-tests: no test title contains '{filt}'")
+    sys.stdout.write(f"1..{len(sel)}\n")
+    top = os.path.realpath(tempfile.mkdtemp(prefix=f"{NAME}-tests."))
+    t = T()
+    try:
+        for k, (title, fn) in enumerate(sel, 1):
+            sys.stdout.write(f"== {title}\n")
+            bad = t.failed
+            t.setup(os.path.join(top, str(k)))
+            try:
+                fn(t)
+            except Exception as e:       # a crashing test is a failure, not the end
+                t.bad(f"the test crashed: {type(e).__name__}: {e}")
+            finally:
+                t.stub.stop()
+            sys.stdout.write(f"{'ok' if t.failed == bad else 'not ok'} {k} - {title}\n")
+            sys.stdout.flush()
+    finally:
+        shutil.rmtree(top, ignore_errors=True)
+    v = sys.version_info
+    sys.stdout.write(f" >>> self-test (python {v.major}.{v.minor}.{v.micro}): "
+                     f"{t.passed} passed, {t.failed} failed\n")
+    return 0 if t.failed == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
