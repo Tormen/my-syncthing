@@ -34,7 +34,7 @@ from typing import Final, NoReturn, cast
 
 NAME: Final = "my-syncthing"
 VERSION: Final = "1.0"
-SCRIPT_COMMIT = "572fd1a"
+SCRIPT_COMMIT = "2d47d02"
 SCRIPT_RELEASE = ""
 CONFIG_ENV: Final = "MY_SYNCTHING_CONFIG"
 ON_MAC: Final = platform.system() == "Darwin"
@@ -1228,6 +1228,8 @@ def cmd_diag(cfg: Config, args: list[str]) -> int:
         p = make_plan(cfg, api, this_host(), my_id)
         for c in p.changes:
             out(f"{c.why}\n    {c.method} {c.path} {json.dumps(c.body)}")
+        if p.cert:
+            out(f"{p.cert.why}\n    {'a new certificate, trusted' if p.cert.renew else 'trusted'} by --install")
         for b in p.blocked:
             out(f"REFUSED: {b}")
         for n in p.notes:
@@ -2508,6 +2510,7 @@ def t_gui_cert(t: T) -> None:
                     "-keyout", key, "-out", cert], capture_output=True, check=True)
     t.has("Syncthing's own certificate (named for the host only): drift", t.run("status")[2],
           "web UI certificate: not for 127.0.0.1")
+    t.has("...and diag plan names it too", t.run("diag", "plan")[1], "web UI certificate: not for 127.0.0.1")
     n = len(t.stub.writes)
     rc, o, _ = t.run("--install")
     t.is_("--install: a certificate for 127.0.0.1 and localhost, the key 0600, Syncthing restarted",
