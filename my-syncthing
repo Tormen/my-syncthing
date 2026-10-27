@@ -34,7 +34,7 @@ from typing import Final, NoReturn, cast
 
 NAME: Final = "my-syncthing"
 VERSION: Final = "1.0"
-SCRIPT_COMMIT = "d2c227b"
+SCRIPT_COMMIT = "572fd1a"
 SCRIPT_RELEASE = ""
 CONFIG_ENV: Final = "MY_SYNCTHING_CONFIG"
 ON_MAC: Final = platform.system() == "Darwin"
@@ -563,11 +563,53 @@ class Change:
     why: str                          # one line: what, and why
 
 
+@dataclass(frozen=True)
+class CertWork:
+    renew: bool                       # a new certificate; else only trusting the one there
+    why: str
+
+
 @dataclass
 class Plan:
     changes: list[Change] = field(default_factory=lambda: [])
     notes: list[str] = field(default_factory=lambda: [])
     blocked: list[str] = field(default_factory=lambda: [])   # differences --install refuses to settle
+    cert: CertWork | None = None      # the web UI certificate, when the browser would warn
+
+    def todo(self) -> list[str]:
+        """What --install would do, one line each."""
+        return [c.why for c in self.changes] + ([self.cert.why] if self.cert else [])
+
+
+CERT_DAYS: Final = 825                # the longest a Mac accepts a TLS server certificate
+CERT_RENEW: Final = 30 * 86400        # replaced this long before it expires
+
+
+def keychain() -> str:
+    return os.path.expanduser("~/Library/Keychains/login.keychain-db")
+
+
+def cert_work(home: str) -> CertWork | None:
+    """Why the web UI certificate makes the browser warn at https://127.0.0.1 (the address `web`
+    opens): Syncthing's own is named for the host only, and self-signed. None when it would not,
+    or when there is no openssl to tell."""
+    openssl = shutil.which("openssl")
+    cert = os.path.join(home, "https-cert.pem")
+    if not openssl:
+        return None
+    if not os.path.isfile(cert):
+        return CertWork(True, f"web UI certificate: none yet at {cert}")
+    san = run([openssl, "x509", "-in", cert, "-noout", "-ext", "subjectAltName"]).stdout
+    if "IP Address:127.0.0.1" not in san:
+        names = " ".join(san.split("\n", 1)[-1].split()) or "no names"
+        return CertWork(True, f"web UI certificate: not for 127.0.0.1 [{names}] -- the browser warns")
+    if run([openssl, "x509", "-in", cert, "-noout", "-checkend", str(CERT_RENEW)]).returncode != 0:
+        end = run([openssl, "x509", "-in", cert, "-noout", "-enddate"]).stdout.strip().split("=", 1)[-1]
+        return CertWork(True, f"web UI certificate: expires within 30 days [{end}]")
+    if ON_MAC and shutil.which("security") and run(
+            ["security", "verify-cert", "-c", cert, "-p", "ssl", "-n", "127.0.0.1", "-L", "-q"]).returncode != 0:
+        return CertWork(False, "web UI certificate: not trusted on this Mac -- the browser warns")
+    return None
 
 
 PHONE_HOME_OFF: Final[dict[str, object]] = {
@@ -712,6 +754,8 @@ def make_plan(cfg: Config, api: Api, host: str, my_id: str) -> Plan:
         if gui.get("useTLS") is not tls:
             p.changes.append(Change("PATCH", "/rest/config/gui", {"useTLS": tls},
                                     f"web UI: useTLS {show(gui.get('useTLS'))} -> {show(tls)}"))
+    if cfg.gui_tls == "yes" or (not cfg.gui_tls and api.obj("/rest/config/gui").get("useTLS") is True):
+        p.cert = cert_work(api.home)
     return p
 
 
@@ -825,9 +869,9 @@ def conditions(cfg: Config, f: Facts) -> list[Condition]:
                                    cfg.sync_grace))
     if f.plan is None:
         found.append(Condition("drift", f"this host is not in the config: DEVICE_{f.host}={f.my_id}"))
-    elif f.plan.changes or f.plan.blocked:
-        found.append(Condition("drift", f"{len(f.plan.changes) + len(f.plan.blocked)} setting(s) not as configured: "
-                               + "; ".join([c.why for c in f.plan.changes] + f.plan.blocked)))
+    elif f.plan.todo() or f.plan.blocked:
+        items = f.plan.todo() + f.plan.blocked
+        found.append(Condition("drift", f"{len(items)} setting(s) not as configured: " + "; ".join(items)))
     return [c for c in found if c.name in cfg.conditions]
 
 
@@ -889,13 +933,14 @@ def render(cfg: Config, f: Facts, st: dict[str, dict[str, dict[str, float]]]) ->
     if f.plan is None:
         out(f" >>> settings: this host is not in the config -- add DEVICE_{f.host}={f.my_id}")
     else:
-        if f.plan.changes:
-            out(f" >>> settings: {len(f.plan.changes)} change(s) `--install` would make:")
-            for c in f.plan.changes:
-                out(f"   > {c.why}")
+        todo = f.plan.todo()
+        if todo:
+            out(f" >>> settings: {len(todo)} change(s) `--install` would make:")
+            for w in todo:
+                out(f"   > {w}")
         for b in f.plan.blocked:
             out(f" >>> settings: REFUSED -- {b}")
-        if not f.plan.changes and not f.plan.blocked:
+        if not todo and not f.plan.blocked:
             out(" >>> settings: as configured [0 changes]")
     if OUT.vrb and f.plan is not None:
         for n in f.plan.notes:
@@ -1426,14 +1471,57 @@ def cmd_install(cfg: Config) -> int:
     if not OUT.simulate and any(c.path == "/rest/config/gui" for c in plan.changes):
         api = connect(cfg)               # the web UI -- and so the API -- changed scheme
         wait_up(api, 30)
+    if plan.cert:
+        api = fix_gui_cert(cfg, api, plan.cert)
     if cfg.check_agent:
         ensure_check_agent(cfg)
     made = "would be made (-S)" if OUT.simulate else "made"
-    out(f" >>> {'nothing to change: as configured' if not plan.changes else f'{len(plan.changes)} change(s) {made}'}"
-        f" [{len(plan.changes)}]")
+    n = len(plan.todo())
+    out(f" >>> {'nothing to change: as configured' if not n else f'{n} change(s) {made}'} [{n}]")
     if host != cfg.hub and cfg.connect_wait and not OUT.simulate:
         wait_hub(cfg, api)
     return 1 if plan.blocked else 0
+
+
+def fix_gui_cert(cfg: Config, api: Api, work: CertWork) -> Api:
+    """A web UI certificate the browser accepts at https://127.0.0.1: one for 127.0.0.1, localhost
+    and this host's name, CERT_DAYS long -- Syncthing keeps one it did not generate and serves it
+    after a restart -- and, on macOS, trusted for TLS in the login keychain. The API comes back
+    reconnected when Syncthing restarted."""
+    out(f"    > {work.why}")
+    cert, key = os.path.join(api.home, "https-cert.pem"), os.path.join(api.home, "https-key.pem")
+    if work.renew:
+        host = this_host()
+        out(f"    > web UI certificate: a new one for 127.0.0.1, localhost and {host}, {CERT_DAYS} days")
+        if not OUT.simulate:
+            tmp = tempfile.mkdtemp(dir=api.home, prefix=".tmp.cert.")
+            try:
+                p = run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+                         "-days", str(CERT_DAYS), "-subj", f"/O={NAME}/CN={host}",
+                         "-addext", f"subjectAltName=IP:127.0.0.1,IP:::1,DNS:localhost,DNS:{host}",
+                         "-addext", "extendedKeyUsage=serverAuth", "-addext", "basicConstraints=critical,CA:FALSE",
+                         "-keyout", os.path.join(tmp, "key"), "-out", os.path.join(tmp, "cert")], "the certificate")
+                if p.returncode != 0:
+                    err("00059", f"openssl could not make the web UI certificate [rc {p.returncode}]: "
+                        f"{p.stderr.strip()}")
+                os.chmod(os.path.join(tmp, "key"), 0o600)
+                os.chmod(os.path.join(tmp, "cert"), 0o644)
+                os.replace(os.path.join(tmp, "key"), key)
+                os.replace(os.path.join(tmp, "cert"), cert)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        cmd_restart(cfg)                 # Syncthing reads its certificate when it starts
+        api = connect(cfg)
+    if ON_MAC and shutil.which("security") and (OUT.simulate or run(
+            ["security", "verify-cert", "-c", cert, "-p", "ssl", "-n", "127.0.0.1", "-L", "-q"]).returncode != 0):
+        out(f"    > web UI certificate: trusted for TLS in {keychain()} -- macOS asks for your password")
+        p = run(["security", "add-trusted-cert", "-r", "trustRoot", "-p", "ssl", "-k", keychain(), cert],
+                "trust it", changes=True)
+        if p.returncode != 0:
+            sys.stderr.write(f"WARNING: the web UI certificate is not trusted [rc {p.returncode}]: "
+                             f"{p.stderr.strip()} -- the dialog needs this Mac's own screen, not ssh; "
+                             f"there run `{NAME} --install` again\n")
+    return api
 
 
 def wait_hub(cfg: Config, api: Api) -> None:
@@ -1516,17 +1604,17 @@ def stamp_version() -> int:
         return subprocess.run(["git", "-C", here, *a], capture_output=True, text=True)
 
     if git("rev-parse", "--git-dir").returncode != 0:
-        err("00059", "--stamp-version: not a git checkout")
+        err("00060", "--stamp-version: not a git checkout")
     if git("rev-parse", "--abbrev-ref", "@{upstream}").returncode == 0 and \
             git("merge-base", "--is-ancestor", "HEAD", "@{upstream}").returncode == 0:
-        err("00060", "--stamp-version: HEAD is already pushed -- amending would rewrite published history")
+        err("00061", "--stamp-version: HEAD is already pushed -- amending would rewrite published history")
     if not git("show", "--name-only", "--format=", "HEAD", "--", rel).stdout.strip():
-        err("00061", "--stamp-version: HEAD does not touch this file -- commit it first")
+        err("00062", "--stamp-version: HEAD does not touch this file -- commit it first")
     staged = git("diff", "--cached", "--name-only").stdout.split()
     if staged:
-        err("00062", f"--stamp-version: something is staged, the amend would fold it in: {' '.join(staged)}")
+        err("00063", f"--stamp-version: something is staged, the amend would fold it in: {' '.join(staged)}")
     if git("diff", "--quiet", "--", rel).returncode != 0:
-        err("00063", "--stamp-version: this file has uncommitted edits -- commit them first")
+        err("00064", "--stamp-version: this file has uncommitted edits -- commit them first")
     sha = git("rev-parse", "--short", "HEAD").stdout.strip()
     desc = git("describe", "--tags", "--long").stdout.strip()
     with open(me) as fh:
@@ -1534,14 +1622,14 @@ def stamp_version() -> int:
     new, n1 = re.subn(r'^SCRIPT_COMMIT = .*$', f'SCRIPT_COMMIT = "{sha}"', src, count=1, flags=re.M)
     new, n2 = re.subn(r'^SCRIPT_RELEASE = .*$', f'SCRIPT_RELEASE = "{desc}"', new, count=1, flags=re.M)
     if (n1, n2) != (1, 1):
-        err("00064", "--stamp-version: the stamp lines are not there")
+        err("00065", "--stamp-version: the stamp lines are not there")
     fd, tmp = tempfile.mkstemp(dir=here, prefix=f".{NAME}.stamp.")
     with os.fdopen(fd, "w") as fh:
         fh.write(new)
     shutil.copymode(me, tmp)
     os.replace(tmp, me)
     if git("add", "--", rel).returncode != 0 or git("commit", "--amend", "--no-edit").returncode != 0:
-        err("00065", "--stamp-version: git add / commit --amend failed")
+        err("00066", "--stamp-version: git add / commit --amend failed")
     out(f"stamped SCRIPT_COMMIT={sha} SCRIPT_RELEASE={desc or '<no tag yet>'} -- "
         f"HEAD is now {git('rev-parse', '--short', 'HEAD').stdout.strip()}")
     return 0
@@ -1685,14 +1773,16 @@ ADMIN
                        config does not know prints its DEVICE_ line and stops.
                        On a peer, a folder that already holds data starts
                        receive-only and becomes send-and-receive when nothing
-                       differs from the hub's copy. As root:
+                       differs from the hub's copy. With the web UI over
+                       https: a certificate for 127.0.0.1, trusted on macOS
+                       (README: "The web UI's certificate"). As root:
                        only the boot-time service of SERVICE=daemon.
   --uninstall          the service and the check agent; data and identity stay
   --create-config [<FILE>]  print the default config, or write it (never over
                        an existing file)
   --test-mail          one test through ALERT_LATER, the path the alerts take
   --export-cert        this host's web UI certificate to ~/Desktop, and how to
-                       trust it (at that host's own screen, not over ssh)
+                       trust it on another machine
   --version            version, commit and build id
   --run-tests [<FILTER>]    the built-in tests (a stub Syncthing; nothing real)
   --stamp-version      record the commit in this file (maintainer)
@@ -1733,7 +1823,7 @@ def internal_error(log_root: str) -> int:
         where = f"the trace is in {path}"
     except OSError:
         where = "the trace could not be written"
-    sys.stderr.write(f"ERROR 00066 [70]: internal error while {PHASE[0]}: {type(e).__name__}: {e} -- {where}\n")
+    sys.stderr.write(f"ERROR 00067 [70]: internal error while {PHASE[0]}: {type(e).__name__}: {e} -- {where}\n")
     return 70
 
 
@@ -1773,7 +1863,7 @@ def _main(args: list[str]) -> int:
             if a == "--config":
                 i += 1
                 if i >= len(args):
-                    err("00067", "--config needs a <FILE>")
+                    err("00068", "--config needs a <FILE>")
                 config = args[i]
             else:
                 config = a.split("=", 1)[1]
@@ -1796,13 +1886,13 @@ def _main(args: list[str]) -> int:
     if verb == "--create-config" or verb.startswith("--create-config="):
         return create_config(verb.split("=", 1)[1] if "=" in verb else (vargs[0] if vargs else ""))
     if verb.startswith("--") and verb[2:] in VERBS:
-        err("00068", f"no such option '{verb}' -- you mean `{NAME} {verb[2:]}`")
+        err("00069", f"no such option '{verb}' -- you mean `{NAME} {verb[2:]}`")
     if verb.startswith("-") and verb not in FLAGS:
-        err("00069", f"unknown option '{verb}' -- `{NAME} --help`")
+        err("00070", f"unknown option '{verb}' -- `{NAME} --help`")
     if verb and not verb.startswith("-") and verb not in VERBS:
-        err("00070", f"no verb '{verb}' -- {', '.join(VERBS)} (`{NAME} --help`)")
+        err("00071", f"no verb '{verb}' -- {', '.join(VERBS)} (`{NAME} --help`)")
     if verb not in ("enable", "disable", "doctor", "rescan", "diag") and vargs:
-        err("00071", f"'{verb or NAME}' takes no argument: {' '.join(vargs)}")
+        err("00072", f"'{verb or NAME}' takes no argument: {' '.join(vargs)}")
     PHASE[0] = "reading the config"
     cfg = read_config(find_config(config))
     install_completion()
@@ -2039,6 +2129,12 @@ class T:
             fh.write(f"#!/bin/dash\nprintf '%s|%s|%s\\n' \"$1\" \"$2\" \"$(printf %s \"$3\" | tr '\\n' ' ')\" "
                      f">> {shlex.quote(self.p('alerts'))}\n")
         os.chmod(self.p("bin", "alert"), 0o755)
+        # macOS' `security`: records each call; a certificate counts as trusted once added
+        with open(self.p("bin", "security"), "w") as fh:
+            fh.write(f"#!/bin/dash\nprintf '%s\\n' \"$*\" >> {shlex.quote(self.p('security.calls'))}\n"
+                     f"case $1 in verify-cert) [ -e {shlex.quote(self.p('trusted'))} ] ;; "
+                     f"add-trusted-cert) touch {shlex.quote(self.p('trusted'))} ;; esac\n")
+        os.chmod(self.p("bin", "security"), 0o755)
         self.conf()
 
     def gui(self, port: int) -> None:
@@ -2078,6 +2174,13 @@ class T:
                 return fh.read().splitlines()
         except FileNotFoundError:
             return []
+
+    def security_calls(self) -> str:
+        try:
+            with open(self.p("security.calls")) as fh:
+                return fh.read()
+        except FileNotFoundError:
+            return ""
 
     def hub_up(self, up: bool = True) -> None:
         self.stub.conns = {ID_HUB: {"connected": True, "address": "192.0.2.1:22000",
@@ -2381,13 +2484,57 @@ def t_identity(t: T) -> None:
 def t_gui_tls(t: T) -> None:
     t.conf(GUI_TLS="yes")
     t.run("--install")
-    t.is_("GUI_TLS=yes: the web UI over https, set last", (t.stub.gui.get("useTLS"), t.stub.writes[-1][1]),
+    config_writes = [w[1] for w in t.stub.writes if w[1].startswith("/rest/config/")]
+    t.is_("GUI_TLS=yes: the web UI over https, the last setting", (t.stub.gui.get("useTLS"), config_writes[-1]),
           (True, "/rest/config/gui"))
     n = len(t.stub.writes)
     t.run("--install")
     t.is_("...and the next run changes nothing", len(t.stub.writes) - n, 0)
     t.conf(GUI_TLS="maybe")
     t.has("GUI_TLS=maybe: refused", t.run("status")[2], "GUI_TLS='maybe' -- yes, no, or empty")
+
+
+def cert_text(path: str) -> str:
+    p = subprocess.run(["openssl", "x509", "-in", path, "-noout", "-subject", "-ext", "subjectAltName"],
+                       capture_output=True, text=True)
+    return p.stdout
+
+
+def t_gui_cert(t: T) -> None:
+    t.conf(GUI_TLS="yes")
+    cert, key = t.p("st", "https-cert.pem"), t.p("st", "https-key.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+                    "-days", "800", "-subj", "/O=Syncthing/CN=somehost", "-addext", "subjectAltName=DNS:somehost",
+                    "-keyout", key, "-out", cert], capture_output=True, check=True)
+    t.has("Syncthing's own certificate (named for the host only): drift", t.run("status")[2],
+          "web UI certificate: not for 127.0.0.1")
+    n = len(t.stub.writes)
+    rc, o, _ = t.run("--install")
+    t.is_("--install: a certificate for 127.0.0.1 and localhost, the key 0600, Syncthing restarted",
+          (rc, "IP Address:127.0.0.1" in cert_text(cert), "DNS:localhost" in cert_text(cert),
+           os.stat(key).st_mode & 0o777, ("POST", "/rest/system/restart") in [w[:2] for w in t.stub.writes[n:]]),
+          (0, True, True, 0o600, True))
+    t.has("...saying why", o, "web UI certificate: not for 127.0.0.1")
+    if ON_MAC:
+        t.has("...and trusted in the login keychain, for TLS", t.security_calls(),
+              f"add-trusted-cert -r trustRoot -p ssl -k {t.p('home')}/Library/Keychains/login.keychain-db {cert}")
+    made = cert_text(cert)
+    n, calls = len(t.stub.writes), t.security_calls().count("add-trusted-cert")
+    rc, o, _ = t.run("--install")
+    t.is_("the next --install: the same certificate, no restart, not trusted again",
+          (rc, cert_text(cert) == made, sum(w[1] == "/rest/system/restart" for w in t.stub.writes[n:]),
+           t.security_calls().count("add-trusted-cert")), (0, True, 0, calls))
+    t.has("...and status: no drift", t.run("status")[1], " >>> settings: as configured")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+                    "-days", "10", "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost",
+                    "-keyout", key, "-out", cert], capture_output=True, check=True)
+    soon = cert_text(cert)
+    t.has("one that expires within 30 days: drift", t.run("status")[2], "web UI certificate: expires within 30 days")
+    t.run("--install")
+    lasts = subprocess.run(["openssl", "x509", "-in", cert, "-noout", "-checkend", str(30 * 86400)],
+                           capture_output=True).returncode == 0
+    t.is_("...replaced by --install with one that lasts", (cert_text(cert) != soon, lasts,
+                                                           "drift" in t.run("status")[2]), (True, True, False))
 
 
 def t_wait_hub(t: T) -> None:
@@ -2490,6 +2637,7 @@ TESTS: Final[tuple[tuple[str, Callable[[T], None]], ...]] = (
     ("--install: a folder at another path is refused", t_path_refused),
     ("--install: a copied identity is refused", t_identity),
     ("--install: GUI_TLS", t_gui_tls),
+    ("--install: the web UI certificate -- for 127.0.0.1, trusted, renewed", t_gui_cert),
     ("--install: waits for the hub, or warns", t_wait_hub),
     ("doctor: every section, read-only", t_doctor),
     ("rescan, restart", t_rescan_restart),
@@ -2503,7 +2651,7 @@ def run_tests(filt: str) -> int:
     """TAP: the plan first, then `ok K - title` / `not ok K - title`."""
     sel = [(title, fn) for title, fn in TESTS if filt in title]
     if not sel:
-        err("00072", f"--run-tests: no test title contains '{filt}'")
+        err("00073", f"--run-tests: no test title contains '{filt}'")
     sys.stdout.write(f"1..{len(sel)}\n")
     top = os.path.realpath(tempfile.mkdtemp(prefix=f"{NAME}-tests."))
     t = T()

@@ -177,12 +177,18 @@ The remedies, least invasive first:
 
 ## The web UI's certificate
 
-With `GUI_TLS=yes` each host's web UI uses its own self-signed
-certificate, and the browser warns until it is trusted. `--export-cert`
-copies it to `~/Desktop/syncthing-<host>.cer` with its subject, expiry and
-SHA-256 fingerprint, and on macOS prints the `security add-trusted-cert`
-line. Trusting must happen at that host's own screen, not over ssh: the
-confirmation dialog appears there.
+With the web UI over https, Syncthing's own certificate makes the browser
+warn at `https://127.0.0.1`: it is named for the host only, and self-signed.
+So `--install` replaces it with one for `127.0.0.1`, `localhost` and the
+host's name, valid 825 days (the longest a Mac accepts), and on macOS trusts
+it for TLS in the login keychain -- macOS asks for the password in a dialog,
+so this needs the Mac's own screen, not ssh. Within 30 days of its end,
+`status` and `check` report it as drift and `--install` renews it.
+
+To trust a host's certificate on ANOTHER machine (its web UI opened by
+name), `--export-cert` copies it to `~/Desktop/syncthing-<host>.cer` with
+its subject, expiry and SHA-256 fingerprint, and on macOS prints the
+`security add-trusted-cert` line.
 
 ## Tests
 
