@@ -34,7 +34,7 @@ from typing import Final, NoReturn, cast
 
 NAME: Final = "my-syncthing"
 VERSION: Final = "1.0"
-SCRIPT_COMMIT = "eaf253a"
+SCRIPT_COMMIT = "970a578"
 SCRIPT_RELEASE = ""
 CONFIG_ENV: Final = "MY_SYNCTHING_CONFIG"
 ON_MAC: Final = platform.system() == "Darwin"
@@ -789,6 +789,7 @@ class Facts:
     folders: list[FolderFacts]
     plan: Plan | None                  # None: this host is not in the config yet
     api: str                           # where its REST API answered
+    dials: str                         # what Syncthing last dialled, and how it went
 
 
 def count_conflicts(path: str) -> int:
@@ -837,8 +838,12 @@ def gather(cfg: Config, api: Api, host: str) -> Facts:
             conflicts=count_conflicts(path) if "conflicts" in cfg.conditions and os.path.isdir(path) else 0,
             remotes=remotes))
     plan = make_plan(cfg, api, host, my_id) if cfg.devices.get(host) == my_id else None
+    # Syncthing's own record of each address it dialled -- the truth, where the
+    # config only says what it SHOULD dial (until --install, the two differ)
+    dialled = sorted(jsub(st, "lastDialStatus").items())
+    dials = "; ".join(f"{a}: {jstr(jobj(v, 'dial status'), 'error') or 'ok'}" for a, v in dialled) or "no dial yet"
     return Facts(host=host, my_id=my_id, version=version, uptime=jint(st, "uptime"), conns=conns, api=api.base,
-                 folders=folders, plan=plan)
+                 folders=folders, plan=plan, dials=dials)
 
 
 @dataclass(frozen=True)
@@ -853,8 +858,7 @@ def conditions(cfg: Config, f: Facts) -> list[Condition]:
     if f.host != cfg.hub and cfg.hub in cfg.devices:
         c = f.conns.get(cfg.devices[cfg.hub], {})
         if c.get("connected") is not True:
-            found.append(Condition("hub-unreachable", f"hub {cfg.hub} not connected [{', '.join(cfg.hub_addresses)}]",
-                                   cfg.hub_grace))
+            found.append(Condition("hub-unreachable", f"hub {cfg.hub} not connected [{f.dials}]", cfg.hub_grace))
     for fo in f.folders:
         if fo.paused:
             continue
@@ -910,7 +914,7 @@ def render(cfg: Config, f: Facts, st: dict[str, dict[str, dict[str, float]]]) ->
         c = f.conns.get(cfg.devices[cfg.hub], {})
         out(f"    > hub {cfg.hub}: " + (f"connected via {jstr(c, 'address')} since {when(jstr(c, 'startedAt'))} "
                                        f"[{jstr(c, 'type')}]" if c.get("connected") is True else
-                                       f"NOT connected [dials {', '.join(cfg.hub_addresses) or 'nothing'}]"))
+                                       f"NOT connected [{f.dials}]"))
     for fo in f.folders:
         if fo.paused:
             since = st["disabled"].get(fo.id, {}).get("at")
@@ -1296,7 +1300,9 @@ def write_file(path: str, data: bytes, why: str) -> bool:
 
 
 def serve_args(cfg: Config, binary: str) -> list[str]:
-    return [binary, "serve", "--no-browser", "--no-restart"] + (
+    # --log-file=default: Syncthing's own syncthing.log, rotated by Syncthing; a
+    # launchd service's stdout goes nowhere
+    return [binary, "serve", "--no-browser", "--no-restart", "--log-file=default"] + (
         [f"--home={os.path.expanduser(cfg.syncthing_home)}"] if cfg.syncthing_home else [])
 
 
@@ -1954,6 +1960,7 @@ class Stub:
         self.need: dict[str, int] = {}
         self.local: dict[str, int] = {}
         self.conns: dict[str, JObj] = {}
+        self.dials: JObj = {}             # lastDialStatus: address -> {when, error}
         self.gui: JObj = {"useTLS": False}
         self.needed: list[str] = []
         self.remote_needed: list[str] = []
@@ -2021,7 +2028,7 @@ class Stub:
         if (method, p) == ("GET", "/rest/system/ping"):
             return 200, {"ping": "pong"}
         if (method, p) == ("GET", "/rest/system/status"):
-            return 200, {"myID": self.my_id, "uptime": 3700}
+            return 200, {"myID": self.my_id, "uptime": 3700, "lastDialStatus": self.dials}
         if (method, p) == ("GET", "/rest/system/version"):
             return 200, {"version": "v2.1.5"}
         if (method, p) == ("GET", "/rest/system/connections"):
@@ -2325,9 +2332,15 @@ def t_status(t: T) -> None:
     t.has("...the config and the API it used", o, f"    > config {t.p('conf')}; Syncthing's ")
     t.hub_up(False)
     rc, o, e = t.run("status")
-    t.is_("hub not connected: rc 1, the condition on stderr",
-          (rc, e.startswith("!!! hub-unreachable: hub hubx not connected [tcp://192.0.2.1:22000]")), (1, True))
+    t.is_("hub not connected, never dialled yet: rc 1, the condition on stderr",
+          (rc, e.startswith("!!! hub-unreachable: hub hubx not connected [no dial yet]")), (1, True))
     t.has("...and the summary names it", o, " >>> 1 condition(s): hub-unreachable")
+    t.stub.dials = {"tcp://198.51.100.7:22000": {"when": "2026-10-28T15:47:50Z", "error": "read tcp: i/o timeout"}}
+    rc, o, e = t.run("status")
+    t.is_("...dialled: what Syncthing DID dial and its error -- not the config's address",
+          ("    > hub hubx: NOT connected [tcp://198.51.100.7:22000: read tcp: i/o timeout]" in o,
+           "hub hubx not connected [tcp://198.51.100.7:22000: read tcp: i/o timeout]" in e, "192.0.2.1" in o + e),
+          (True, True, False))
     rc, o, e = t.run("-Q", "status")
     t.is_("-Q: nothing on stdout, the condition still on stderr", (rc, o, "!!! hub-unreachable" in e), (1, "", True))
 
@@ -2385,7 +2398,7 @@ def t_alerts(t: T) -> None:
     t.conf()
     rc, _, _ = t.run("check")
     t.is_("held: rc 1, ALERT_NOW once", (rc, t.alerts()),
-          (1, [f"now|{NAME} {t.host}: hub-unreachable|hub hubx not connected [tcp://192.0.2.1:22000]"]))
+          (1, [f"now|{NAME} {t.host}: hub-unreachable|hub hubx not connected [no dial yet]"]))
     t.run("check")
     t.is_("...not again on the next check", len(t.alerts()), 1)
     path = t.p("state", "state.json")
@@ -2488,6 +2501,12 @@ def t_identity(t: T) -> None:
     rc, _, e = t.run("--install")
     t.is_("this device's ID is another host's in the config: refused, nothing written",
           (rc, "a copied Syncthing config?" in e, len(t.stub.writes)), (2, True, 0))
+
+
+def t_service_log(t: T) -> None:
+    argv = serve_args(read_config(t.p("conf")), "/x/syncthing")
+    t.is_("the service writes its log to a file (a LaunchDaemon's own output goes nowhere)",
+          "--log-file=default" in argv, True)
 
 
 def t_gui_tls(t: T) -> None:
@@ -2646,6 +2665,7 @@ TESTS: Final[tuple[tuple[str, Callable[[T], None]], ...]] = (
     ("an unexpected error: rc 70, the trace in a file", t_unexpected),
     ("--install: a folder at another path is refused", t_path_refused),
     ("--install: a copied identity is refused", t_identity),
+    ("--install: the service logs to Syncthing's own syncthing.log", t_service_log),
     ("--install: GUI_TLS", t_gui_tls),
     ("--install: the web UI certificate -- for 127.0.0.1, trusted, renewed", t_gui_cert),
     ("--install: waits for the hub, or warns", t_wait_hub),
