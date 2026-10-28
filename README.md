@@ -78,7 +78,15 @@ a second run prints nothing to change.
 1. **Syncthing** itself: on macOS through Homebrew (`brew install
    syncthing`); on Linux it asks for the distro package. A running
    Syncthing.app is refused: the service replaces it and uses the same
-   config directory, so the device keeps its identity.
+   config directory, so the device keeps its identity. The formula, not the
+   app (cask `syncthing-app`), because: the app is a menu-bar program that
+   starts its own Syncthing only when someone logs in at the screen, so it
+   cannot be a hub's boot-time `daemon`; this tool runs and configures the
+   service itself and needs the plain binary at a fixed path
+   (`/opt/homebrew/bin/syncthing`); and every Mac runs the same build from
+   the same source. The cost: Homebrew's binary is unsigned -- it needs
+   Little Snitch rules of its own (written by `--install` as root), and each
+   upgrade makes Little Snitch ask once whether the modified program is fine.
 2. **Identity**: created on first start, never copied between hosts. A host
    the config does not know yet prints its `DEVICE_<host>=` line and the
    folders it is in no `hosts=` of, and stops -- that is how a new host
