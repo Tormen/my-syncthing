@@ -203,6 +203,12 @@ it for TLS in the login keychain -- macOS asks for the password in a dialog,
 so this needs the Mac's own screen, not ssh. Within 30 days of its end,
 `status` and `check` report it as drift and `--install` renews it.
 
+my-syncthing itself trusts the web UI by its certificate being EXACTLY the
+one in Syncthing's `https-cert.pem`, compared byte for byte, never as the
+anchor of a chain check: Apple's python (LibreSSL) refuses Syncthing's own
+certificate that way, so the first `--install` could not even reach
+Syncthing to replace it.
+
 To trust a host's certificate on ANOTHER machine (its web UI opened by
 name), `--export-cert` copies it to `~/Desktop/syncthing-<host>.cer` with
 its subject, expiry and SHA-256 fingerprint, and on macOS prints the

@@ -11,6 +11,7 @@ PYTHONPATH and the user's site out, -S skips site.
 from __future__ import annotations
 
 import contextlib
+import http.client
 import hashlib
 import io
 import json
@@ -470,6 +471,52 @@ def jnum(o: JObj, k: str) -> float:
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
 
 
+def tls_pin(home: str) -> tuple[ssl.SSLContext, bytes]:
+    """What the web UI is trusted by: EXACTLY the certificate in HOME's
+    https-cert.pem, compared byte for byte -- not a chain check with it as the
+    trust anchor, which Apple's python (LibreSSL 2.8.3) refuses for
+    Syncthing's own certificate. The context checks no chain; the pin is the
+    check. Read again on every connect: --install swaps the certificate."""
+    path = os.path.join(home, "https-cert.pem")
+    try:
+        with open(path) as fh:
+            pin = ssl.PEM_cert_to_DER_cert(fh.read())
+    except (OSError, ValueError) as e:
+        raise Down("00074", f"no web UI certificate to trust at {path} [{e}]") from e
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx, pin
+
+
+class _PinnedHTTPS(http.client.HTTPSConnection):
+    """An https connection that is refused unless the server's certificate
+    is the pinned one."""
+    pin = b""
+
+    def connect(self) -> None:
+        super().connect()
+        sock = self.sock
+        der = sock.getpeercert(binary_form=True) if isinstance(sock, ssl.SSLSocket) else None
+        if der != self.pin:
+            self.close()
+            raise ssl.SSLError("the served certificate is not the certificate in https-cert.pem")
+
+
+class _PinnedHandler(urllib.request.HTTPSHandler):
+    def __init__(self, ctx: ssl.SSLContext, pin: bytes) -> None:
+        super().__init__(context=ctx)
+        self._ctx, self._pin = ctx, pin
+
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        pin = self._pin
+
+        class Conn(_PinnedHTTPS):
+            pass
+        Conn.pin = pin
+        return self.do_open(Conn, req, context=self._ctx)  # pyright: ignore[reportUnknownMemberType]  # typeshed: untyped
+
+
 @dataclass
 class Api:
     """One Syncthing instance, found through its own config.xml."""
@@ -477,6 +524,7 @@ class Api:
     key: str
     ctx: ssl.SSLContext | None
     home: str
+    pin: bytes
 
     def call(self, method: str, path: str, body: object = None) -> object:
         data = None if body is None else json.dumps(body).encode()
@@ -484,7 +532,9 @@ class Api:
                                      headers={"X-API-Key": self.key, "Content-Type": "application/json"})
         dbg(f"{method} {path}" + (f" {json.dumps(body)}" if body is not None else ""))
         try:
-            with urllib.request.urlopen(req, context=self.ctx, timeout=20) as r:
+            opener = urllib.request.build_opener(_PinnedHandler(self.ctx, self.pin)) if self.ctx \
+                else urllib.request.build_opener()
+            with opener.open(req, timeout=20) as r:
                 raw = r.read()
         except urllib.error.HTTPError as e:
             err("00025", f"Syncthing refused {method} {path} [HTTP {e.code}]: "
@@ -532,13 +582,9 @@ def connect(cfg: Config) -> Api:
     if addr.startswith("/") or addr.startswith("unix"):
         err("00032", f"{conf}: GUI address '{addr}' -- a socket; {NAME} needs host:port")
     tls = gui.get("tls") == "true"
-    ctx: ssl.SSLContext | None = None
-    if tls:
-        # Syncthing's own self-signed certificate is the one to trust here
-        ctx = ssl.create_default_context(cafile=os.path.join(home, "https-cert.pem"))
-        ctx.check_hostname = False
+    ctx, pin = tls_pin(home) if tls else (None, b"")
     host = addr.replace("0.0.0.0", "127.0.0.1").replace("[::]", "[::1]")
-    return Api(base=f"{'https' if tls else 'http'}://{host}", key=key, ctx=ctx, home=home)
+    return Api(base=f"{'https' if tls else 'http'}://{host}", key=key, ctx=ctx, home=home, pin=pin)
 
 
 def wait_up(api: Api, seconds: int) -> None:
@@ -2729,6 +2775,64 @@ def t_launchd_reload(t: T) -> None:
     t.is_("...and it is loaded", os.path.exists(t.p("loaded")), True)
 
 
+def t_api_pinned(t: T) -> None:
+    # the web UI's certificate is trusted by being EXACTLY the one in https-cert.pem -- never
+    # as a trust anchor: Apple's python (LibreSSL 2.8.3) refuses Syncthing's own certificate
+    # that way ("unable to get local issuer certificate", horse 2026-10-28 22:32)
+    import threading
+    def cert(name: str, *extra: str) -> tuple[str, str]:
+        c, k = t.p(f"{name}.pem"), t.p(f"{name}.key")
+        p = subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+                            "-pkeyopt", "ec_param_enc:named_curve", "-nodes", "-subj", "/CN=horse",
+                            "-addext", "keyUsage=critical,digitalSignature", "-addext",
+                            "basicConstraints=critical,CA:FALSE", *extra, "-keyout", k, "-out", c],
+                           capture_output=True, text=True)
+        return (c, k) if p.returncode == 0 else ("", p.stderr)
+    old, why = cert("old", "-not_before", "20200101000000Z", "-not_after", "20200102000000Z")
+    if not old:
+        t.ok(f"this openssl cannot make an expired certificate -- nothing to check [{why.strip()[:60]}]")
+        return
+    other, _ = cert("other", "-days", "30")
+    srv = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    srv.load_cert_chain(old, t.p("old.key"))
+    ls = socket.socket()
+    ls.bind(("127.0.0.1", 0))
+    ls.listen(4)
+    port = ls.getsockname()[1]
+    def serve() -> None:
+        while True:
+            try:
+                c, _ = ls.accept()
+            except OSError:
+                return
+            try:
+                with srv.wrap_socket(c, server_side=True) as sc:
+                    sc.recv(4096)
+                    sc.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{"ping":"pong"}')
+            except (OSError, ssl.SSLError):
+                pass
+    threading.Thread(target=serve, daemon=True).start()
+    home = t.p("sthome")
+    os.makedirs(home, exist_ok=True)
+    try:
+        shutil.copy(old, os.path.join(home, "https-cert.pem"))
+        ctx, pin = tls_pin(home)
+        api = Api(base=f"https://127.0.0.1:{port}", key="k", ctx=ctx, home=home, pin=pin)
+        t.is_("the certificate served IS the one in https-cert.pem: trusted -- even one no chain check "
+              "would accept (expired)", api.get("/rest/system/ping"), {"ping": "pong"})
+        shutil.copy(other, os.path.join(home, "https-cert.pem"))
+        ctx, pin = tls_pin(home)
+        api = Api(base=f"https://127.0.0.1:{port}", key="k", ctx=ctx, home=home, pin=pin)
+        try:
+            api.get("/rest/system/ping")
+            t.bad("another certificate than the file's was trusted")
+        except Down as e:
+            t.has("...another certificate than the file's: refused, saying so", e.msg,
+                  "not the certificate in https-cert.pem")
+    finally:
+        ls.close()
+
+
 def t_gui_cert_named_curve(t: T) -> None:
     # macOS's own openssl (LibreSSL) writes an EC key with EXPLICIT curve parameters unless told
     # otherwise; Syncthing (Go) refuses that key ("x509: invalid ECDSA parameters") and replaces the
@@ -2851,6 +2955,7 @@ TESTS: Final[tuple[tuple[str, Callable[[T], None]], ...]] = (
     ("--install: GUI_TLS", t_gui_tls),
     ("--install: the web UI certificate -- for 127.0.0.1, trusted, renewed", t_gui_cert),
     ("--install: the web UI key names its curve, whichever openssl makes it", t_gui_cert_named_curve),
+    ("the API over https: trusted by being the exact certificate of https-cert.pem", t_api_pinned),
     ("--install: the web UI certificate -- a refused trust is not counted as made", t_cert_denied),
     ("--install: a changed service is reloaded once launchd has let go of the old one", t_launchd_reload),
     ("--install: waits for the hub, or warns", t_wait_hub),
