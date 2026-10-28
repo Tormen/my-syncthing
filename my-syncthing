@@ -1575,7 +1575,10 @@ def fix_gui_cert(cfg: Config, api: Api, work: CertWork) -> tuple[Api, bool]:
         if not OUT.simulate:
             tmp = tempfile.mkdtemp(dir=api.home, prefix=".tmp.cert.")
             try:
-                p = run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+                # named_curve: LibreSSL (macOS's openssl) writes explicit parameters by default, a
+                # key Syncthing cannot load -- it then makes a certificate of its own instead
+                p = run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+                         "-pkeyopt", "ec_param_enc:named_curve", "-nodes",
                          "-days", str(CERT_DAYS), "-subj", f"/O={NAME}/CN={host}",
                          "-addext", f"subjectAltName=IP:127.0.0.1,IP:::1,DNS:localhost,DNS:{host}",
                          "-addext", "extendedKeyUsage=serverAuth", "-addext", "basicConstraints=critical,CA:FALSE",
@@ -2726,6 +2729,24 @@ def t_launchd_reload(t: T) -> None:
     t.is_("...and it is loaded", os.path.exists(t.p("loaded")), True)
 
 
+def t_gui_cert_named_curve(t: T) -> None:
+    # macOS's own openssl (LibreSSL) writes an EC key with EXPLICIT curve parameters unless told
+    # otherwise; Syncthing (Go) refuses that key ("x509: invalid ECDSA parameters") and replaces the
+    # certificate with one of its own -- horse, 2026-10-28 21:03, where --install ran on that openssl
+    libre = "/usr/bin/openssl"
+    if not os.path.exists(libre) or "LibreSSL" not in subprocess.run([libre, "version"], capture_output=True,
+                                                                    text=True).stdout:
+        t.ok("no LibreSSL openssl here -- nothing to check")
+        return
+    t.conf(GUI_TLS="yes")
+    os.symlink(libre, t.p("bin", "openssl"))
+    t.run("--install")
+    key = subprocess.run([libre, "pkey", "-in", t.p("st", "https-key.pem"), "-noout", "-text"],
+                         capture_output=True, text=True).stdout
+    t.is_("--install with LibreSSL's openssl: the key names its curve, as Syncthing can load it",
+          ("ASN1 OID: prime256v1" in key, "Field Type" in key), (True, False))
+
+
 def t_wait_hub(t: T) -> None:
     t.conf(CONNECT_WAIT="2s")
     rc, _, e = t.run("--install")
@@ -2829,6 +2850,7 @@ TESTS: Final[tuple[tuple[str, Callable[[T], None]], ...]] = (
     ("--install as root: the Little Snitch rules, or one line why not", t_firewall),
     ("--install: GUI_TLS", t_gui_tls),
     ("--install: the web UI certificate -- for 127.0.0.1, trusted, renewed", t_gui_cert),
+    ("--install: the web UI key names its curve, whichever openssl makes it", t_gui_cert_named_curve),
     ("--install: the web UI certificate -- a refused trust is not counted as made", t_cert_denied),
     ("--install: a changed service is reloaded once launchd has let go of the old one", t_launchd_reload),
     ("--install: waits for the hub, or warns", t_wait_hub),
