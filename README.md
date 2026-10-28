@@ -96,7 +96,8 @@ a second run prints nothing to change.
    (the peers come in from anywhere; Syncthing itself admits only the devices
    of its config); on a peer, outgoing to each `HUB_ADDRESSES` entry of the
    form `tcp://<name>:<port>` (an IP or a quic address is named as not
-   covered). Without Little Snitch or my-little-snitch: one line, skipped.
+   covered). Owned by `SYNC_USER`, as Little Snitch's own alert writes them
+   (else anyone). Without Little Snitch or my-little-snitch: one line, skipped.
 4. **Settings** by role: listen addresses, the phone-home switches (as
    switches -- an emptied list comes back as `default`; STUN keep-alive
    too), no browser, and the web UI's TLS when `GUI_TLS` says.

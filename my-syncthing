@@ -36,7 +36,7 @@ from typing import Final, NoReturn, cast
 
 NAME: Final = "my-syncthing"
 VERSION: Final = "1.0"
-SCRIPT_COMMIT = "3528c0d"
+SCRIPT_COMMIT = "8d94e6a"
 SCRIPT_RELEASE = ""
 CONFIG_ENV: Final = "MY_SYNCTHING_CONFIG"
 ON_MAC: Final = platform.system() == "Darwin"
@@ -1334,9 +1334,11 @@ def firewall_rules(cfg: Config, host: str, binary: str) -> tuple[list[list[str]]
     """The Little Snitch rules this host's Syncthing needs, as FIREWALL's arguments, and the
     hub addresses they leave uncovered. The hub: any incoming connection -- the peers come in
     from anywhere, and Syncthing itself admits only the devices of its config. A peer: outgoing
-    to each hub address given as tcp://<name>:<port> (FIREWALL writes host names, not IPs)."""
+    to each hub address given as tcp://<name>:<port> (FIREWALL writes host names, not IPs).
+    Owned by SYNC_USER, who runs Syncthing, as Little Snitch's own alert writes it -- else anyone."""
+    owner = ["--owner", cfg.sync_user or "anyone"]
     if host == cfg.hub:
-        return [["allow", binary, "any", "--incoming", "--port", "any", "--owner", "anyone"]], []
+        return [["allow", binary, "any", "--incoming", "--port", "any", *owner]], []
     rules: list[list[str]] = []
     left: list[str] = []
     for a in cfg.hub_addresses:
@@ -1344,7 +1346,7 @@ def firewall_rules(cfg: Config, host: str, binary: str) -> tuple[list[list[str]]
         if m is None or re.fullmatch(r"[\d.]+", m.group(1)):
             left.append(a)
         else:
-            rules.append(["allow", binary, m.group(1), "--host", "--port", m.group(2), "--owner", "anyone"])
+            rules.append(["allow", binary, m.group(1), "--host", "--port", m.group(2), *owner])
     return rules, left
 
 
@@ -2573,6 +2575,11 @@ def t_firewall(t: T) -> None:
           rules, [["allow", "/x/syncthing", "hub.example.org", "--host", "--port", "18229", "--owner", "anyone"]])
     t.is_("...an IP and a quic address named as not covered", left,
           ["tcp://192.0.2.1:22000", "quic://hub.example.org:18229"])
+    t.conf(HUB_ADDRESSES="tcp://hub.example.org:18229", SYNC_USER="someone")
+    by_user = read_config(t.p("conf"))
+    owners = [r[-2:] for h in ("hubx", t.host) for r in firewall_rules(by_user, h, "/x/syncthing")[0]]
+    t.is_("with SYNC_USER: owned by who runs Syncthing, as Little Snitch's alert writes it",
+          owners, [["--owner", "someone"], ["--owner", "someone"]])
     calls = t.p("snitch.calls")
     with open(t.p("bin", FIREWALL), "w") as fh:
         fh.write(f"#!/bin/dash\nprintf '%s\\n' \"$*\" >> {shlex.quote(calls)}\necho ' >>> added: x' >&2\n")
