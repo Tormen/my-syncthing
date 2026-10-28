@@ -193,4 +193,7 @@ its subject, expiry and SHA-256 fingerprint, and on macOS prints the
 ## Tests
 
 `my-syncthing --run-tests [<FILTER>]` runs the built-in suite against a stub
-Syncthing REST API on loopback -- nothing real is touched.
+Syncthing REST API on loopback -- nothing real is touched. `<FILTER>` picks
+tests by title. Each test builds what it needs in a directory of its own, so
+the tests run in parallel blocks (one per core); the TAP lines keep each
+test's number from the list, and a block's detail prints in one piece.

@@ -34,7 +34,7 @@ from typing import Final, NoReturn, cast
 
 NAME: Final = "my-syncthing"
 VERSION: Final = "1.0"
-SCRIPT_COMMIT = "2d47d02"
+SCRIPT_COMMIT = "eaf253a"
 SCRIPT_RELEASE = ""
 CONFIG_ENV: Final = "MY_SYNCTHING_CONFIG"
 ON_MAC: Final = platform.system() == "Darwin"
@@ -2657,16 +2657,69 @@ TESTS: Final[tuple[tuple[str, Callable[[T], None]], ...]] = (
 )
 
 
+RT_PICK: Final = "MY_SYNCTHING_TEST_PICK"   # set in a block's process: the places of its tests
+
+
 def run_tests(filt: str) -> int:
-    """TAP: the plan first, then `ok K - title` / `not ok K - title`."""
+    """TAP: the plan first, then `ok K - title` / `not ok K - title` as each test
+    ends. The selected tests are dealt round-robin into BLOCKS run in parallel,
+    one process and temp root each; a test keeps its number from the list, so
+    the TAP lines say the same in any order. They stream as they come; the rest
+    of a block's output is printed in ONE piece when it ends."""
     sel = [(title, fn) for title, fn in TESTS if filt in title]
     if not sel:
         err("00073", f"--run-tests: no test title contains '{filt}'")
+    if RT_PICK in os.environ:
+        return run_block(sel, [int(x) for x in os.environ[RT_PICK].split(",")])
+    import threading
     sys.stdout.write(f"1..{len(sel)}\n")
+    sys.stdout.flush()
+    nblk = max(1, min(len(sel), os.cpu_count() or 2))
+    picks = [",".join(str(j) for j in range(b, len(sel), nblk)) for b in range(nblk)]
+    procs = [subprocess.Popen([sys.executable, "-I", "-S", "-B", os.path.realpath(__file__), "--run-tests", filt],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              env={**os.environ, RT_PICK: pick}, text=True) for pick in picks]
+    lock = threading.Lock()
+    tap = re.compile(r"(not )?ok \d+ - ")
+    outs: list[list[str]] = [[] for _ in procs]
+
+    def pump(p: subprocess.Popen[str], got: list[str]) -> None:
+        assert p.stdout is not None
+        for ln in p.stdout:
+            got.append(ln)
+            if tap.match(ln):
+                with lock:
+                    sys.stdout.write(ln)
+                    sys.stdout.flush()
+        p.wait()
+    pumps = [threading.Thread(target=pump, args=(p, got), daemon=True) for p, got in zip(procs, outs)]
+    for th in pumps:
+        th.start()
+    passed = failed = 0
+    for pick, p, th, got in zip(picks, procs, pumps, outs):
+        th.join()
+        with lock:                       # the other blocks' TAP lines still stream
+            sys.stdout.write(f"\n >>> tests {pick}\n" + "".join(ln for ln in got if not tap.match(ln)))
+            sys.stdout.flush()
+        m = re.search(r"^ >>> block: (\d+) passed, (\d+) failed$", "".join(got), re.MULTILINE)
+        if m is None:
+            sys.stdout.write(f"  FAIL block {pick} ended without its summary [rc {p.returncode}]\n")
+            failed += 1
+        else:
+            passed, failed = passed + int(m.group(1)), failed + int(m.group(2))
+    v = sys.version_info
+    sys.stdout.write(f" >>> self-test (python {v.major}.{v.minor}.{v.micro}): {passed} passed, {failed} failed "
+                     f"[{len(sel)} test(s) in {nblk} block(s)]\n")
+    return 0 if failed == 0 else 1
+
+
+def run_block(sel: list[tuple[str, Callable[[T], None]]], places: list[int]) -> int:
+    """One block: the tests at PLACES of the selection, in a temp root of its own."""
     top = os.path.realpath(tempfile.mkdtemp(prefix=f"{NAME}-tests."))
     t = T()
     try:
-        for k, (title, fn) in enumerate(sel, 1):
+        for j in places:
+            k, (title, fn) = j + 1, sel[j]
             sys.stdout.write(f"== {title}\n")
             bad = t.failed
             t.setup(os.path.join(top, str(k)))
@@ -2680,9 +2733,7 @@ def run_tests(filt: str) -> int:
             sys.stdout.flush()
     finally:
         shutil.rmtree(top, ignore_errors=True)
-    v = sys.version_info
-    sys.stdout.write(f" >>> self-test (python {v.major}.{v.minor}.{v.micro}): "
-                     f"{t.passed} passed, {t.failed} failed\n")
+    sys.stdout.write(f" >>> block: {t.passed} passed, {t.failed} failed\n")
     return 0 if t.failed == 0 else 1
 
 
