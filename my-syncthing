@@ -36,7 +36,7 @@ from typing import Final, NoReturn, cast
 
 NAME: Final = "my-syncthing"
 VERSION: Final = "1.0"
-SCRIPT_COMMIT = "ced0cf3"
+SCRIPT_COMMIT = "236afee"
 SCRIPT_RELEASE = ""
 CONFIG_ENV: Final = "MY_SYNCTHING_CONFIG"
 ON_MAC: Final = platform.system() == "Darwin"
@@ -1314,6 +1314,12 @@ def launchd_load(domain: str, label: str, path: str, changed: bool) -> None:
         return
     if loaded:
         run(["launchctl", "bootout", f"{domain}/{label}"], "reload: its file changed", changes=True)
+        # launchd lets go of it a moment AFTER bootout returns; a bootstrap
+        # before that fails with rc 5 and leaves the service unloaded
+        end = time.time() + 15
+        while not OUT.simulate and time.time() < end and \
+                run(["launchctl", "print", f"{domain}/{label}"]).returncode == 0:
+            time.sleep(0.5)
     p = run(["launchctl", "bootstrap", domain, path], "start it", changes=True)
     if p.returncode != 0:
         err("00042", f"launchctl bootstrap {domain} {path} failed [rc {p.returncode}]: {p.stderr.strip()}")
@@ -2695,6 +2701,31 @@ def t_cert_denied(t: T) -> None:
           (rc, " >>> 1 change(s) made [1]" in o), (0, True))
 
 
+def t_launchd_reload(t: T) -> None:
+    # launchd lets go of a booted-out service a moment AFTER bootout returns; a
+    # bootstrap in that moment fails with rc 5 (ada, 2026-10-28: the service was
+    # left unloaded, Syncthing down)
+    loaded = shlex.quote(t.p("loaded"))
+    open(t.p("loaded"), "w").close()
+    with open(t.p("bin", "launchctl"), "w") as fh:
+        fh.write(f"#!/bin/dash\ncase $1 in\n  print) [ -e {loaded} ] ;;\n"
+                 f"  bootout) ( sleep 1; rm -f {loaded} ) >/dev/null 2>&1 & ;;\n"
+                 f"  bootstrap) if [ -e {loaded} ]; then echo 'Bootstrap failed: 5: Input/output error' >&2; "
+                 f"exit 5; fi; touch {loaded} ;;\nesac\n")
+    os.chmod(t.p("bin", "launchctl"), 0o755)
+    path = os.environ["PATH"]
+    os.environ["PATH"] = t.p("bin") + os.pathsep + path
+    try:
+        launchd_load("system", "test.label", t.p("x.plist"), True)
+        t.ok("a changed service: booted out, then loaded again once launchd has let go")
+    except Err as e:
+        t.bad(f"the reload failed: ERROR {e.code}: {e.msg}")
+    finally:
+        os.environ["PATH"] = path
+    time.sleep(1.5)                      # past the stub's delayed let-go of the old one
+    t.is_("...and it is loaded", os.path.exists(t.p("loaded")), True)
+
+
 def t_wait_hub(t: T) -> None:
     t.conf(CONNECT_WAIT="2s")
     rc, _, e = t.run("--install")
@@ -2799,6 +2830,7 @@ TESTS: Final[tuple[tuple[str, Callable[[T], None]], ...]] = (
     ("--install: GUI_TLS", t_gui_tls),
     ("--install: the web UI certificate -- for 127.0.0.1, trusted, renewed", t_gui_cert),
     ("--install: the web UI certificate -- a refused trust is not counted as made", t_cert_denied),
+    ("--install: a changed service is reloaded once launchd has let go of the old one", t_launchd_reload),
     ("--install: waits for the hub, or warns", t_wait_hub),
     ("doctor: every section, read-only", t_doctor),
     ("rescan, restart", t_rescan_restart),
