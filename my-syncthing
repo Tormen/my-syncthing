@@ -36,7 +36,7 @@ from typing import Final, NoReturn, cast
 
 NAME: Final = "my-syncthing"
 VERSION: Final = "1.0"
-SCRIPT_COMMIT = "84b5a01"
+SCRIPT_COMMIT = "ced0cf3"
 SCRIPT_RELEASE = ""
 CONFIG_ENV: Final = "MY_SYNCTHING_CONFIG"
 ON_MAC: Final = platform.system() == "Darwin"
@@ -1540,23 +1540,27 @@ def cmd_install(cfg: Config) -> int:
     if not OUT.simulate and any(c.path == "/rest/config/gui" for c in plan.changes):
         api = connect(cfg)               # the web UI -- and so the API -- changed scheme
         wait_up(api, 30)
+    trusted = True
     if plan.cert:
-        api = fix_gui_cert(cfg, api, plan.cert)
+        api, trusted = fix_gui_cert(cfg, api, plan.cert)
     if cfg.check_agent:
         ensure_check_agent(cfg)
     made = "would be made (-S)" if OUT.simulate else "made"
     n = len(plan.todo())
-    out(f" >>> {'nothing to change: as configured' if not n else f'{n} change(s) {made}'} [{n}]")
+    if trusted:
+        out(f" >>> {'nothing to change: as configured' if not n else f'{n} change(s) {made}'} [{n}]")
+    else:                                # the one change a run cannot force: macOS asks a person
+        out(f" >>> 1 change NOT made: the web UI certificate is not trusted [made {n - 1} of {n}]")
     if host != cfg.hub and cfg.connect_wait and not OUT.simulate:
         wait_hub(cfg, api)
-    return 1 if plan.blocked else 0
+    return 1 if plan.blocked or not trusted else 0
 
 
-def fix_gui_cert(cfg: Config, api: Api, work: CertWork) -> Api:
+def fix_gui_cert(cfg: Config, api: Api, work: CertWork) -> tuple[Api, bool]:
     """A web UI certificate the browser accepts at https://127.0.0.1: one for 127.0.0.1, localhost
     and this host's name, CERT_DAYS long -- Syncthing keeps one it did not generate and serves it
-    after a restart -- and, on macOS, trusted for TLS in the login keychain. The API comes back
-    reconnected when Syncthing restarted."""
+    after a restart -- and, on macOS, trusted for TLS in the login keychain. Returns the API,
+    reconnected when Syncthing restarted, and False when macOS refused the trust."""
     out(f"    > {work.why}")
     cert, key = os.path.join(api.home, "https-cert.pem"), os.path.join(api.home, "https-key.pem")
     if work.renew:
@@ -1589,7 +1593,8 @@ def fix_gui_cert(cfg: Config, api: Api, work: CertWork) -> Api:
             sys.stderr.write(f"WARNING: the web UI certificate is not trusted [rc {p.returncode}]: "
                              f"{p.stderr.strip()} -- the dialog needs this Mac's own screen, not ssh; "
                              f"there run `{NAME} --install` again\n")
-    return api
+            return api, False
+    return api, True
 
 
 def wait_hub(cfg: Config, api: Api) -> None:
@@ -2204,7 +2209,9 @@ class T:
         with open(self.p("bin", "security"), "w") as fh:
             fh.write(f"#!/bin/dash\nprintf '%s\\n' \"$*\" >> {shlex.quote(self.p('security.calls'))}\n"
                      f"case $1 in verify-cert) [ -e {shlex.quote(self.p('trusted'))} ] ;; "
-                     f"add-trusted-cert) touch {shlex.quote(self.p('trusted'))} ;; esac\n")
+                     f"add-trusted-cert) if [ -e {shlex.quote(self.p('deny'))} ]; then echo 'The authorization "
+                     f"was denied since no user interaction was possible.' >&2; exit 1; fi; "
+                     f"touch {shlex.quote(self.p('trusted'))} ;; esac\n")
         os.chmod(self.p("bin", "security"), 0o755)
         self.conf()
 
@@ -2669,6 +2676,25 @@ def t_gui_cert(t: T) -> None:
                                                            "drift" in t.run("status")[2]), (True, True, False))
 
 
+def t_cert_denied(t: T) -> None:
+    if not ON_MAC:
+        t.ok("(macOS only: the keychain)")
+        return
+    t.conf(GUI_TLS="yes")
+    t.run("--install")                     # the certificate made, trusted, Syncthing restarted
+    os.remove(t.p("trusted"))              # ...and the trust gone again: only the trust is left to do
+    open(t.p("deny"), "w").close()         # macOS refuses it, as under my-rollout on ada
+    rc, o, e = t.run("--install")
+    t.is_("the trust refused: rc 1, the WARNING, and NOT counted as made",
+          (rc, "WARNING: the web UI certificate is not trusted" in e, "change(s) made" in o,
+           " >>> 1 change NOT made: the web UI certificate is not trusted [made 0 of 1]" in o),
+          (1, True, False, True))
+    os.remove(t.p("deny"))
+    rc, o, _ = t.run("--install")
+    t.is_("at the screen, the next --install: trusted, counted, rc 0",
+          (rc, " >>> 1 change(s) made [1]" in o), (0, True))
+
+
 def t_wait_hub(t: T) -> None:
     t.conf(CONNECT_WAIT="2s")
     rc, _, e = t.run("--install")
@@ -2772,6 +2798,7 @@ TESTS: Final[tuple[tuple[str, Callable[[T], None]], ...]] = (
     ("--install as root: the Little Snitch rules, or one line why not", t_firewall),
     ("--install: GUI_TLS", t_gui_tls),
     ("--install: the web UI certificate -- for 127.0.0.1, trusted, renewed", t_gui_cert),
+    ("--install: the web UI certificate -- a refused trust is not counted as made", t_cert_denied),
     ("--install: waits for the hub, or warns", t_wait_hub),
     ("doctor: every section, read-only", t_doctor),
     ("rescan, restart", t_rescan_restart),
