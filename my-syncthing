@@ -1166,15 +1166,23 @@ def cmd_rescan(cfg: Config, args: list[str]) -> int:
     return 0
 
 
-def cmd_restart(cfg: Config) -> int:
-    api = connect(cfg)
+def restart(cfg: Config, api: Api) -> Api:
+    """Restart Syncthing through API -- a connection that trusts the certificate it serves NOW --
+    and come back connected anew, trusting what it serves AFTER: fix_gui_cert swaps the
+    certificate in between, and a connection made after the swap could not send the restart."""
     api.write(Change("POST", "/rest/system/restart", None, ""))
     if OUT.simulate:
-        return 0
+        return api
     start = time.time()
     time.sleep(1)
+    api = connect(cfg)
     wait_up(api, 60)
     out(f" >>> Syncthing restarted [answering again after {time.time() - start:.0f}s]")
+    return api
+
+
+def cmd_restart(cfg: Config) -> int:
+    restart(cfg, connect(cfg))
     return 0
 
 
@@ -1512,8 +1520,7 @@ def fix_gui_cert(cfg: Config, api: Api, work: CertWork) -> Api:
                 os.replace(os.path.join(tmp, "cert"), cert)
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
-        cmd_restart(cfg)                 # Syncthing reads its certificate when it starts
-        api = connect(cfg)
+        api = restart(cfg, api)          # Syncthing reads its certificate when it starts
     if ON_MAC and shutil.which("security") and (OUT.simulate or run(
             ["security", "verify-cert", "-c", cert, "-p", "ssl", "-n", "127.0.0.1", "-L", "-q"]).returncode != 0):
         out(f"    > web UI certificate: trusted for TLS in {keychain()} -- macOS asks for your password")
