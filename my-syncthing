@@ -36,7 +36,7 @@ from typing import Final, NoReturn, cast
 
 NAME: Final = "my-syncthing"
 VERSION: Final = "1.0"
-SCRIPT_COMMIT = "8d94e6a"
+SCRIPT_COMMIT = "84b5a01"
 SCRIPT_RELEASE = ""
 CONFIG_ENV: Final = "MY_SYNCTHING_CONFIG"
 ON_MAC: Final = platform.system() == "Darwin"
@@ -2793,6 +2793,11 @@ def run_tests(filt: str) -> int:
     sel = [(title, fn) for title, fn in TESTS if filt in title]
     if not sel:
         err("00073", f"--run-tests: no test title contains '{filt}'")
+    # A suite started in the background by a non-interactive shell inherits
+    # SIGINT IGNORED, and so would every tool run it starts: the Ctrl-C test
+    # then waits out its slow alert. Restore the default for this process --
+    # the runs it starts get SIGINT back as Python's Ctrl-C.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     if RT_PICK in os.environ:
         return run_block(sel, [int(x) for x in os.environ[RT_PICK].split(",")])
     import threading
