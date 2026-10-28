@@ -86,8 +86,17 @@ a second run prints nothing to change.
 3. **Service** as `SYNC_USER`: `agent` -- a LaunchAgent / a systemd `--user`
    unit, while the user is logged in; `daemon` -- a LaunchDaemon with
    `UserName` / `syncthing@<user>.service`, from boot. A daemon needs root:
-   `my-syncthing --install` run as root installs only that, then again as
-   the user. `none` -- something else starts Syncthing.
+   `my-syncthing --install` run as root installs it, then again as the
+   user. `none` -- something else starts Syncthing.
+
+   Run as root, on any host, `--install` also writes the **Little Snitch
+   rules** before the service starts, through
+   [my-little-snitch](https://github.com/Tormen/my-little-snitch), so Little
+   Snitch asks nobody: on the hub, any incoming connection to its syncthing
+   (the peers come in from anywhere; Syncthing itself admits only the devices
+   of its config); on a peer, outgoing to each `HUB_ADDRESSES` entry of the
+   form `tcp://<name>:<port>` (an IP or a quic address is named as not
+   covered). Without Little Snitch or my-little-snitch: one line, skipped.
 4. **Settings** by role: listen addresses, the phone-home switches (as
    switches -- an emptied list comes back as `default`; STUN keep-alive
    too), no browser, and the web UI's TLS when `GUI_TLS` says.

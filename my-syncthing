@@ -10,7 +10,9 @@ PYTHONPATH and the user's site out, -S skips site.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import platform
@@ -34,7 +36,7 @@ from typing import Final, NoReturn, cast
 
 NAME: Final = "my-syncthing"
 VERSION: Final = "1.0"
-SCRIPT_COMMIT = "970a578"
+SCRIPT_COMMIT = "3528c0d"
 SCRIPT_RELEASE = ""
 CONFIG_ENV: Final = "MY_SYNCTHING_CONFIG"
 ON_MAC: Final = platform.system() == "Darwin"
@@ -1324,12 +1326,64 @@ def plist(label: str, argv: list[str], extra: JObj) -> bytes:
     return plistlib.dumps(d)
 
 
-def install_daemon(cfg: Config) -> int:
-    """As root: only the boot-time service, run as SYNC_USER."""
+FIREWALL: Final = "my-little-snitch"       # Little Snitch's rules from the command line -- optional
+_little_snitch_app = "/Applications/Little Snitch.app"
+
+
+def firewall_rules(cfg: Config, host: str, binary: str) -> tuple[list[list[str]], list[str]]:
+    """The Little Snitch rules this host's Syncthing needs, as FIREWALL's arguments, and the
+    hub addresses they leave uncovered. The hub: any incoming connection -- the peers come in
+    from anywhere, and Syncthing itself admits only the devices of its config. A peer: outgoing
+    to each hub address given as tcp://<name>:<port> (FIREWALL writes host names, not IPs)."""
+    if host == cfg.hub:
+        return [["allow", binary, "any", "--incoming", "--port", "any", "--owner", "anyone"]], []
+    rules: list[list[str]] = []
+    left: list[str] = []
+    for a in cfg.hub_addresses:
+        m = re.fullmatch(r"tcp[46]?://([^/:\[\]]+):(\d+)", a)
+        if m is None or re.fullmatch(r"[\d.]+", m.group(1)):
+            left.append(a)
+        else:
+            rules.append(["allow", binary, m.group(1), "--host", "--port", m.group(2), "--owner", "anyone"])
+    return rules, left
+
+
+def ensure_firewall(cfg: Config, host: str, binary: str) -> None:
+    """As root, before the service starts: firewall_rules through FIREWALL, so Little Snitch
+    asks nobody -- skipped, in one line, where either is not installed. -S shows them."""
+    PHASE[0] = "the Little Snitch rules"
+    tool = shutil.which(FIREWALL)
+    if not os.path.isdir(_little_snitch_app) or not tool:
+        out(f"    > Little Snitch rules: skipped -- "
+            + ("Little Snitch is not installed" if not os.path.isdir(_little_snitch_app) else f"no {FIREWALL} on PATH"))
+        return
+    rules, left = firewall_rules(cfg, host, binary)
+    for r in rules:
+        p = run([tool, r[0], *([] if OUT.simulate else ["go"]), *r[1:]], "a Little Snitch rule")
+        for line in (p.stdout + p.stderr).splitlines():
+            out(f"    {line}")
+        if p.returncode != 0:
+            sys.stderr.write(f"WARNING: the Little Snitch rule was not written [rc {p.returncode}] -- "
+                             f"Little Snitch will ask at the first connection\n")
+    for a in left:
+        out(f"    > Little Snitch: no rule for {a} -- {FIREWALL} writes host names over tcp")
+
+
+def install_root(cfg: Config) -> int:
+    """As root, what needs root: the Little Snitch rules, then the boot-time service of
+    SERVICE=daemon, run as SYNC_USER."""
     host = this_host()
-    if cfg.service_of(host) != "daemon":
-        err("00043", f"SERVICE for {host} is '{cfg.service_of(host)}', not daemon -- run --install as the "
-            f"user{' ' + cfg.sync_user if cfg.sync_user else ''}, not as root")
+    kind = cfg.service_of(host)
+    binary = syncthing_bin()
+    if not binary:
+        err("00046", f"no syncthing on PATH -- run `{NAME} --install` as {cfg.sync_user or 'the user'} "
+            f"first (it installs it)")
+    out(f" >>> {host} ({'hub' if host == cfg.hub else 'peer'}; SERVICE={kind}) as root")
+    ensure_firewall(cfg, host, binary)
+    if kind != "daemon":
+        out(f" >>> done -- nothing else needs root here; now `{NAME} --install` as "
+            f"{cfg.sync_user or 'the user'}")
+        return 0
     if not cfg.sync_user:
         err("00044", "SYNC_USER is empty -- a daemon needs to know whose Syncthing it runs")
     import pwd
@@ -1337,9 +1391,6 @@ def install_daemon(cfg: Config) -> int:
         pw = pwd.getpwnam(cfg.sync_user)
     except KeyError:
         err("00045", f"SYNC_USER='{cfg.sync_user}': no such user on {host}")
-    binary = syncthing_bin()
-    if not binary:
-        err("00046", f"no syncthing on PATH -- run `{NAME} --install` as {cfg.sync_user} first (it installs it)")
     PHASE[0] = "installing the boot-time service"
     out(f" >>> {host}: Syncthing from boot, as {cfg.sync_user} (SERVICE=daemon)")
     if ON_MAC:
@@ -1445,7 +1496,7 @@ def ensure_check_agent(cfg: Config) -> None:
 def cmd_install(cfg: Config) -> int:
     host = this_host()
     if os.getuid() == 0:
-        return install_daemon(cfg)
+        return install_root(cfg)
     user = this_user()
     if cfg.sync_user and cfg.sync_user != user:
         err("00054", f"SYNC_USER is '{cfg.sync_user}', this is '{user}' -- run --install as {cfg.sync_user}")
@@ -1791,7 +1842,9 @@ ADMIN
                        differs from the hub's copy. With the web UI over
                        https: a certificate for 127.0.0.1, trusted on macOS
                        (README: "The web UI's certificate"). As root:
-                       only the boot-time service of SERVICE=daemon.
+                       what needs root -- the Little Snitch rules (where
+                       Little Snitch and my-little-snitch are installed),
+                       and the boot-time service of SERVICE=daemon.
   --uninstall          the service and the check agent; data and identity stay
   --create-config [<FILE>]  print the default config, or write it (never over
                        an existing file)
@@ -2509,6 +2562,49 @@ def t_service_log(t: T) -> None:
           "--log-file=default" in argv, True)
 
 
+def t_firewall(t: T) -> None:
+    t.conf(HUB_ADDRESSES="tcp://hub.example.org:18229 tcp://192.0.2.1:22000 quic://hub.example.org:18229")
+    cfg = read_config(t.p("conf"))
+    rules, left = firewall_rules(cfg, "hubx", "/x/syncthing")
+    t.is_("the hub: any incoming connection to its syncthing, nothing outgoing", (rules, left),
+          ([["allow", "/x/syncthing", "any", "--incoming", "--port", "any", "--owner", "anyone"]], list[str]()))
+    rules, left = firewall_rules(cfg, t.host, "/x/syncthing")
+    t.is_("a peer: outgoing to the hub's name and port, nothing incoming",
+          rules, [["allow", "/x/syncthing", "hub.example.org", "--host", "--port", "18229", "--owner", "anyone"]])
+    t.is_("...an IP and a quic address named as not covered", left,
+          ["tcp://192.0.2.1:22000", "quic://hub.example.org:18229"])
+    calls = t.p("snitch.calls")
+    with open(t.p("bin", FIREWALL), "w") as fh:
+        fh.write(f"#!/bin/dash\nprintf '%s\\n' \"$*\" >> {shlex.quote(calls)}\necho ' >>> added: x' >&2\n")
+    os.chmod(t.p("bin", FIREWALL), 0o755)
+    old_path, old_app = os.environ.get("PATH", ""), _little_snitch_app
+
+    def go(path: str, app: str, simulate: bool = False) -> str:
+        global _little_snitch_app
+        got = io.StringIO()
+        os.environ["PATH"], _little_snitch_app, OUT.simulate = path, app, simulate
+        try:
+            with contextlib.redirect_stdout(got):
+                ensure_firewall(cfg, "hubx", "/x/syncthing")
+        finally:
+            os.environ["PATH"], _little_snitch_app, OUT.simulate = old_path, old_app, False
+        return got.getvalue()
+
+    o = go("/usr/bin:/bin", t.p("bin"))
+    t.is_("no my-little-snitch: skipped, in one line", (o.strip(), os.path.exists(calls)),
+          (f"> Little Snitch rules: skipped -- no {FIREWALL} on PATH", False))
+    o = go(t.p("bin"), t.p("no-such.app"))
+    t.is_("no Little Snitch: skipped, in one line", (o.strip(), os.path.exists(calls)),
+          ("> Little Snitch rules: skipped -- Little Snitch is not installed", False))
+    o = go(t.p("bin"), t.p("bin"), simulate=True)
+    t.is_("-S: shown, without go", open(calls).read().splitlines(),
+          ["allow /x/syncthing any --incoming --port any --owner anyone"])
+    o = go(t.p("bin"), t.p("bin"))
+    t.is_("...and added with go", open(calls).read().splitlines()[-1],
+          "allow go /x/syncthing any --incoming --port any --owner anyone")
+    t.has("...what it said, passed on", o, ">>> added: x")
+
+
 def t_gui_tls(t: T) -> None:
     t.conf(GUI_TLS="yes")
     t.run("--install")
@@ -2666,6 +2762,7 @@ TESTS: Final[tuple[tuple[str, Callable[[T], None]], ...]] = (
     ("--install: a folder at another path is refused", t_path_refused),
     ("--install: a copied identity is refused", t_identity),
     ("--install: the service logs to Syncthing's own syncthing.log", t_service_log),
+    ("--install as root: the Little Snitch rules, or one line why not", t_firewall),
     ("--install: GUI_TLS", t_gui_tls),
     ("--install: the web UI certificate -- for 127.0.0.1, trusted, renewed", t_gui_cert),
     ("--install: waits for the hub, or warns", t_wait_hub),
