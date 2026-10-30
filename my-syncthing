@@ -1646,9 +1646,11 @@ def fix_gui_cert(cfg: Config, api: Api, work: CertWork) -> tuple[Api, bool]:
                 "trust it", changes=True)
         if p.returncode != 0:
             sys.stderr.write(f"WARNING: the web UI certificate is not trusted [rc {p.returncode}]: "
-                             f"{p.stderr.strip()} -- macOS shows the dialog only to a process of the "
-                             f"screen's login session (not under ssh, su or launchctl asuser): in a "
-                             f"Terminal at this Mac's screen, run `{NAME} --install` again\n")
+                             f"{p.stderr.strip()} -- macOS shows the dialog only to a program the "
+                             f"screen's session started, such as a Terminal window there (a command run "
+                             f"directly by ssh, su or launchctl asuser is refused; `launchctl asuser <uid> "
+                             f"open -a Terminal <file>` opens such a window): run `{NAME} --install` "
+                             f"again in one\n")
             return api, False
     return api, True
 
@@ -2745,6 +2747,8 @@ def t_cert_denied(t: T) -> None:
           (rc, "WARNING: the web UI certificate is not trusted" in e, "change(s) made" in o,
            " >>> 1 change NOT made: the web UI certificate is not trusted [made 0 of 1]" in o),
           (1, True, False, True))
+    t.is_("the WARNING names the route that works: a Terminal window opened by launchctl asuser",
+          "`launchctl asuser <uid> open -a Terminal <file>`" in e, True)
     os.remove(t.p("deny"))
     rc, o, _ = t.run("--install")
     t.is_("at the screen, the next --install: trusted, counted, rc 0",
