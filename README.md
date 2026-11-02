@@ -45,6 +45,9 @@ conditions and errors), `-V` (more detail), `-D` (each REST call),
 Exit: 0 healthy, 1 a condition holds (or `--install` needs the config
 changed), 2 an error.
 
+Whoever runs it -- root too -- reads the Syncthing of `SYNC_USER` (its home's
+`Library/Application Support/Syncthing`), never one of its own.
+
 ## The config
 
 Shell syntax, sourced by `/bin/sh` -- so it may source a site file of its

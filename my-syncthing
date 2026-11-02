@@ -130,7 +130,8 @@ PEER_LISTEN="tcp://127.0.0.1:22000"   # a peer listens on loopback only: it dial
 PHONE_HOME=no             # no: global and LAN announce, relays, NAT, usage
                           # reports, upgrade check and crash reports all off
 
-SYNC_USER=""              # who runs Syncthing; empty: the user running --install
+SYNC_USER=""              # who runs Syncthing -- every verb reads THAT Syncthing,
+                          # root included; empty: the user running the tool
 SERVICE=agent             # agent: while that user is logged in; daemon: from
                           # boot, as that user (installed by --install as root);
                           # none: started by something else
@@ -384,14 +385,30 @@ def this_user() -> str:
     return pwd.getpwuid(os.getuid()).pw_name
 
 
+def sync_user_home(cfg: Config) -> str:
+    """The home of whoever runs Syncthing: SYNC_USER's when set -- so root, or
+    anyone, reads THAT Syncthing, never one of its own -- else this user's."""
+    if not cfg.sync_user:
+        return os.path.expanduser("~")
+    import pwd
+    try:
+        return pwd.getpwnam(cfg.sync_user).pw_dir
+    except KeyError:
+        err("00075", f"SYNC_USER='{cfg.sync_user}': no such user on {this_host()}")
+
+
 def syncthing_home(cfg: Config) -> str:
-    """Syncthing's config directory: the configured one, else its default."""
+    """Syncthing's config directory: the configured one, else its default --
+    both under SYNC_USER's home (sync_user_home)."""
+    home = sync_user_home(cfg)
     if cfg.syncthing_home:
-        return os.path.expanduser(cfg.syncthing_home)
+        p = cfg.syncthing_home
+        return home + p[1:] if p == "~" or p.startswith("~/") else p
     if ON_MAC:
-        return os.path.expanduser("~/Library/Application Support/Syncthing")
-    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-    for d in (os.path.join(state, "syncthing"), os.path.expanduser("~/.config/syncthing")):
+        return os.path.join(home, "Library/Application Support/Syncthing")
+    own = home == os.path.expanduser("~")     # XDG_STATE_HOME is this user's, not SYNC_USER's
+    state = (os.environ.get("XDG_STATE_HOME") if own else None) or os.path.join(home, ".local/state")
+    for d in (os.path.join(state, "syncthing"), os.path.join(home, ".config/syncthing")):
         if os.path.isfile(os.path.join(d, "config.xml")):
             return d
     return os.path.join(state, "syncthing")
@@ -1351,7 +1368,7 @@ def serve_args(cfg: Config, binary: str) -> list[str]:
     # --log-file=default: Syncthing's own syncthing.log, rotated by Syncthing; a
     # launchd service's stdout goes nowhere
     return [binary, "serve", "--no-browser", "--no-restart", "--log-file=default"] + (
-        [f"--home={os.path.expanduser(cfg.syncthing_home)}"] if cfg.syncthing_home else [])
+        [f"--home={syncthing_home(cfg)}"] if cfg.syncthing_home else [])
 
 
 def launchd_load(domain: str, label: str, path: str, changed: bool) -> None:
@@ -2629,6 +2646,31 @@ def t_service_log(t: T) -> None:
           "--log-file=default" in argv, True)
 
 
+def t_sync_user_home(t: T) -> None:
+    import pwd
+    me = this_user()
+    mine = pwd.getpwnam(me).pw_dir
+    old = os.environ.get("HOME", "")
+    os.environ["HOME"] = t.p("home")       # run by someone whose ~ is not SYNC_USER's, as root on the hub
+    try:
+        t.conf(SYNCTHING_HOME="", SYNC_USER=me)
+        got = syncthing_home(read_config(t.p("conf")))
+        t.is_("SYNC_USER set: that user's Syncthing, whoever runs the tool",
+              (got.startswith(mine + os.sep), got.startswith(t.p("home"))), (True, False))
+        t.conf(SYNCTHING_HOME="~/st", SYNC_USER=me)
+        t.is_("...SYNCTHING_HOME's ~ is that user's too",
+              syncthing_home(read_config(t.p("conf"))), os.path.join(mine, "st"))
+        t.conf(SYNCTHING_HOME="", SYNC_USER="")
+        t.is_("SYNC_USER empty: this user's own",
+              syncthing_home(read_config(t.p("conf"))).startswith(t.p("home") + os.sep), True)
+    finally:
+        os.environ["HOME"] = old
+    t.conf(SYNC_USER="no-such-user-x")
+    rc, _, e = t.run("status")
+    t.is_("SYNC_USER names nobody here: refused, naming it",
+          (rc, "SYNC_USER='no-such-user-x': no such user" in e), (2, True))
+
+
 def t_firewall(t: T) -> None:
     t.conf(HUB_ADDRESSES="tcp://hub.example.org:18229 tcp://192.0.2.1:22000 quic://hub.example.org:18229")
     cfg = read_config(t.p("conf"))
@@ -2956,6 +2998,7 @@ TESTS: Final[tuple[tuple[str, Callable[[T], None]], ...]] = (
     ("--install: a folder at another path is refused", t_path_refused),
     ("--install: a copied identity is refused", t_identity),
     ("--install: the service logs to Syncthing's own syncthing.log", t_service_log),
+    ("SYNC_USER: whose Syncthing is read, whoever runs the tool", t_sync_user_home),
     ("--install as root: the Little Snitch rules, or one line why not", t_firewall),
     ("--install: GUI_TLS", t_gui_tls),
     ("--install: the web UI certificate -- for 127.0.0.1, trusted, renewed", t_gui_cert),
