@@ -37,7 +37,7 @@ from typing import Final, NoReturn, cast
 
 NAME: Final = "my-syncthing"
 VERSION: Final = "1.0"
-SCRIPT_COMMIT = "86df7c9"
+SCRIPT_COMMIT = "af4165f"
 SCRIPT_RELEASE = ""
 CONFIG_ENV: Final = "MY_SYNCTHING_CONFIG"
 ON_MAC: Final = platform.system() == "Darwin"
@@ -443,16 +443,28 @@ def load_state(cfg: Config) -> dict[str, dict[str, dict[str, float]]]:
 
 
 def save_state(cfg: Config, st: dict[str, dict[str, dict[str, float]]]) -> None:
-    """Temp file + rename: an interrupt never leaves half a state."""
+    """Temp file + rename: an interrupt never leaves half a state.
+
+    The file keeps the mode it has (whatever the host's policy set it to), and
+    a new one gets the umask's -- never mkstemp's 600, which a permission sweep
+    would change back on every run."""
     if OUT.simulate:
         return
     d = state_dir(cfg)
+    path = os.path.join(d, "state.json")
     try:
         os.makedirs(d, exist_ok=True)
+        try:
+            mode = os.stat(path).st_mode & 0o7777
+        except FileNotFoundError:
+            mask = os.umask(0)
+            os.umask(mask)
+            mode = 0o666 & ~mask
         fd, tmp = tempfile.mkstemp(dir=d, prefix=".state.")
         with os.fdopen(fd, "w") as fh:
             json.dump(st, fh, indent=1, sort_keys=True)
-        os.replace(tmp, os.path.join(d, "state.json"))
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
     except OSError as e:
         err("00023", f"cannot write my state in '{d}': {e.strerror}")
 
@@ -2556,6 +2568,18 @@ def t_alerts(t: T) -> None:
     t.is_("...once", len(t.alerts()), 3)
 
 
+def t_state_mode(t: T) -> None:
+    t.run("--install")
+    t.run("check")
+    path = t.p("state", "state.json")
+    mask = os.umask(0)
+    os.umask(mask)
+    t.is_("a new state.json: the umask's mode, not mkstemp's 600", os.stat(path).st_mode & 0o7777, 0o666 & ~mask)
+    os.chmod(path, 0o640)
+    t.run("check")
+    t.is_("rewritten: keeps the mode the host's policy set", os.stat(path).st_mode & 0o7777, 0o640)
+
+
 def t_test_mail(t: T) -> None:
     rc, o, _ = t.run("--test-mail")
     t.is_("--test-mail: through ALERT_LATER, rc 0", (rc, t.alerts()[0].split("|")[:2]),
@@ -2990,6 +3014,7 @@ TESTS: Final[tuple[tuple[str, Callable[[T], None]], ...]] = (
     ("disable / enable: one folder, all; --install leaves them", t_disable),
     ("check: drift", t_drift),
     ("check: grace, alert now, later once, cleared", t_alerts),
+    ("state.json: a new one takes the umask, a rewrite keeps its mode", t_state_mode),
     ("--test-mail", t_test_mail),
     ("-S changes nothing", t_simulate),
     ("Syncthing not running", t_not_running),
